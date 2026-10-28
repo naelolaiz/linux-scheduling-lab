@@ -35,6 +35,12 @@ def read(path):
         return {"status": "unavailable", "reason": str(exc)}
 
 
+def decode_mount_path(value):
+    for old, new in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+        value = value.replace(old, new)
+    return value
+
+
 def kernel_config(release):
     attempts = []
     for path in (Path("/proc/config.gz"), Path("/boot") / ("config-" + release),
@@ -79,13 +85,8 @@ def unified_cgroup():
         if right.split()[0] != "cgroup2":
             continue
         fields = left.split()
-        # mountinfo escapes spaces, tabs, newlines and backslashes as octal.
-        def unescape(value):
-            for old, new in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
-                value = value.replace(old, new)
-            return value
-        mount = Path(unescape(fields[4]))
-        root = Path(unescape(fields[3]))
+        mount = Path(decode_mount_path(fields[4]))
+        root = Path(decode_mount_path(fields[3]))
         try:
             relative = Path(paths[0]).relative_to(root)
         except ValueError:

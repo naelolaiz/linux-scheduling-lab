@@ -114,6 +114,12 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(len(image)-len(header), 160*90)
         self.assertGreater(data["checksum"], 0)
 
+    def test_video_frame_independent_of_warmup(self):
+        self.success("--mode", "video", "--jobs", "1", "--work", "1", "--warmup", "0")
+        expected = self.prefix.with_suffix(".pgm").read_bytes()
+        self.success("--mode", "video", "--jobs", "1", "--work", "1", "--warmup", "1")
+        self.assertEqual(self.prefix.with_suffix(".pgm").read_bytes(), expected)
+
     def test_fault_probe(self):
         demand = self.success("--mode", "audio", "--jobs", "4", "--period-us", "1000", "--memory", "demand")
         prefault = self.success("--mode", "audio", "--jobs", "4", "--period-us", "1000", "--memory", "prefault")
@@ -217,6 +223,12 @@ class HarnessTests(unittest.TestCase):
             with self.assertRaises(Unavailable):
                 with cpu_groups(directory, [{"cpu.weight": "100"}]):
                     self.fail("ordinary directory accepted as cgroup")
+            for name, value in (("cgroup.controllers", "cpu"), ("cgroup.subtree_control", "cpu"),
+                                ("cgroup.type", "domain")):
+                (Path(directory) / name).write_text(value)
+            with self.assertRaises(Unavailable):
+                with cpu_groups(directory, [{"cpu.weight": "100"}]):
+                    self.fail("lookalike files must not masquerade as real kernel controls")
 
     def test_harness_timeout_reaps_process_group(self):
         with tempfile.TemporaryDirectory() as directory:

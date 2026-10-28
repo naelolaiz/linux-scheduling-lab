@@ -311,6 +311,8 @@ static void video_work(struct buffers *b, int job, int work) {
     for (int y = 0; y < HEIGHT; y++)
         for (int x = 0; x < WIDTH; x++)
             b->image[y*WIDTH+x] = (uint8_t)((x*3+y*5+job*7) & 255);
+    // Both ping-pong buffers must retain this frame's border, not the previous frame's.
+    std::ranges::copy(b->image,b->scratch.begin());
     for (int p = 0; p < work; p++) {
         for (int y = 1; y < HEIGHT-1; y++) {
             for (int x = 1; x < WIDTH-1; x++) {

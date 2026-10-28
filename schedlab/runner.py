@@ -192,6 +192,7 @@ def run(preset, output, repetitions=3, cpu=None, allow_rt=False, parent=None, la
                         results = run_group(specs, output, repetition, groups=groups)
                         for result, group, control in zip(results, groups, controls):
                             result["cgroup"] = {"requested": control,
+                                                "effective": {name: read(group / name) for name in control},
                                                 "cpu_stat_after": read(group / "cpu.stat"),
                                                 "cpu_pressure_after": read(group / "cpu.pressure")}
                         manifest["runs"].extend(results)

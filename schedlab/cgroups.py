@@ -4,10 +4,21 @@ from contextlib import contextmanager
 import errno
 from pathlib import Path
 import tempfile
+from .environment import decode_mount_path
 
 
 class Unavailable(RuntimeError):
     pass
+
+
+def on_cgroup2_mount(path):
+    matches = []
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        left, right = line.split(" - ", 1)
+        mount = Path(decode_mount_path(left.split()[4]))
+        if path == mount or mount in path.parents:
+            matches.append((len(mount.parts), right.split()[0]))
+    return bool(matches) and max(matches)[1] == "cgroup2"
 
 
 @contextmanager
@@ -15,7 +26,7 @@ def cpu_groups(parent, controls):
     root = Path(parent).resolve()
     owned = []
     try:
-        if not (root / "cgroup.controllers").is_file():
+        if not on_cgroup2_mount(root) or not (root / "cgroup.controllers").is_file():
             raise Unavailable("parent is not a visible cgroup v2 directory")
         if "cpu" not in (root / "cgroup.subtree_control").read_text().split():
             raise Unavailable("cpu must already be enabled in the delegated parent's cgroup.subtree_control")

@@ -28,16 +28,26 @@ These are **manual setup examples**, not commands the lab executes:
 
 | Distribution | Packages / manual command |
 |---|---|
-| Gentoo, including OpenRC | `emerge --ask sys-devel/gcc dev-build/make dev-lang/python` |
-| Debian / Ubuntu | `apt install g++ make python3` |
-| Fedora | `dnf install gcc-c++ make python3` |
-| Alpine / musl | `apk add g++ make python3` |
+| [Gentoo / Portage](https://wiki.gentoo.org/wiki/Handbook:AMD64/Working/Portage), including OpenRC | `emerge --ask sys-devel/gcc dev-build/make dev-lang/python` |
+| [Debian / Ubuntu apt](https://manpages.debian.org/bookworm/apt/apt.8.en.html) | `apt install g++ make python3` |
+| [Fedora / DNF](https://dnf.readthedocs.io/en/latest/command_ref.html) | `dnf install gcc-c++ make python3` |
+| [Alpine / apk](https://docs.alpinelinux.org/user-handbook/0.1a/Working/apk.html), musl | `apk add g++ make python3` |
 
 Gentoo's selected compiler must support C++20; `g++ --version` and
 `python3 --version` show what the current shell actually uses. No OpenRC service
 needs to be started. Use `make CXX=clang++` to choose Clang, or specify your
 cross-toolchain's C++ compiler. When changing compiler/flags, run `make clean`
 first so the binary is rebuilt.
+
+**Build/setup sources:** [GCC](https://gcc.gnu.org/projects/cxx-status.html#cxx20),
+[Clang](https://clang.llvm.org/cxx_status.html#cxx20) and
+[libstdc++ library support](https://gcc.gnu.org/onlinedocs/libstdc++/manual/status.html)
+distinguish compiler features from library availability.
+[Make variable overrides](https://www.gnu.org/software/make/manual/html_node/Overriding.html),
+[Gentoo's compiler setup](https://wiki.gentoo.org/wiki/GCC) and
+[OpenRC](https://wiki.gentoo.org/wiki/OpenRC) explain the corresponding tools.
+The stated minima are compatibility targets, not vendor support guarantees;
+prefer maintained releases (see [Python version status](https://devguide.python.org/versions/)).
 
 From the repository root:
 
@@ -68,22 +78,29 @@ automatically named directories include a timestamp. No background service remai
 Cleanup means removing **only your chosen run directory**, using your usual file
 manager. `make clean` removes just the native build product, not results.
 
+**Artifact sources:** the lab's [PCM WAV serializer](../native/media.hpp),
+Python's [WAV inspection API](https://docs.python.org/3/library/wave.html), and
+the [PGM format manual](https://manpages.debian.org/bookworm/netpbm/pgm.5.en.html)
+describe the generated files. The [runner](../schedlab/runner.py) defines the
+manifest and fresh-directory behavior; these are project interfaces, not
+kernel-standard result formats.
+
 ## 2. Read the measurements before changing priorities
 
 For each periodic job the native code records:
 
 | Quantity | Definition / interpretation |
 |---|---|
-| Release | Planned absolute `CLOCK_MONOTONIC` release, not the time it finally ran |
+| Release | Planned absolute [`CLOCK_MONOTONIC`](https://man7.org/linux/man-pages/man2/clock_gettime.2.html) release, not the time it finally ran |
 | Start | Actual start of processing after the absolute sleep |
 | Finish | Completion of native work, not completion of later artifact writes |
 | Wake-up lateness | Start minus release |
 | Wall processing latency | Finish minus start; includes preemption and blocking |
-| Thread CPU processing | `CLOCK_THREAD_CPUTIME_ID` consumed in the processing section |
+| Thread CPU processing | [`CLOCK_THREAD_CPUTIME_ID`](https://man7.org/linux/man-pages/man2/clock_gettime.2.html) consumed in the processing section |
 | Response time | Finish minus release; captures both wake delay and processing |
 | Deadline miss | Finish strictly after release plus relative deadline |
 | Throughput | Completed jobs per elapsed second; see fixed-window distinction below |
-| Faults/context switches | `getrusage` deltas across the measured run, not setup or file output |
+| Faults/context switches | [`getrusage`](https://man7.org/linux/man-pages/man2/getrusage.2.html) deltas across the measured run, not setup or file output |
 
 Audio/video releases advance by a fixed period, even after a miss. Late jobs are
 processed in sequence, not silently dropped or rescheduled from "now". Thus an
@@ -120,28 +137,38 @@ No expected numeric ranking is a test assertion. Thermal state, other users,
 virtualization, caches, compiler changes and kernel behavior are real confounders.
 Thirty buffers is a demonstration, not a reliable estimate of a rare tail.
 
+**Measurement sources:** [absolute `clock_nanosleep` releases](https://man7.org/linux/man-pages/man2/clock_nanosleep.2.html),
+[autogroup/task-group effects](https://man7.org/linux/man-pages/man7/sched.7.html),
+and [NIST's guidance on comparative experimental designs](https://www.itl.nist.gov/div898/handbook/pri/section3/pri33.htm).
+For percentile conventions, compare the [inclusive interpolation description](https://docs.python.org/3/library/statistics.html#statistics.quantiles)
+with this lab's [exact formulas and window/miss rules](../schedlab/metrics.py).
+Those formulas describe observed samples; they do not establish population-tail
+confidence intervals or a WCET bound.
+
 ## 3. Policy map: what the knobs actually do
 
 | Policy/control | Strength | Cost / important limit |
 |---|---|---|
-| `SCHED_OTHER`, nice -20..19 | General-purpose fair scheduling; lower nice means larger relative weight | Not a CPU cap, reservation, or real-time guarantee; grouping affects comparisons |
-| `SCHED_BATCH` | Noninteractive CPU-intensive work | Same fair class, different wake-up treatment; not universally faster |
-| `SCHED_IDLE` | Best-effort background work that may make little progress | Can starve under contention; not the kernel's idle thread |
-| `SCHED_FIFO`, priority 1..99 | Fixed-priority preemption; suitable for carefully bounded periodic tasks | Can starve lower priorities; equal-priority tasks do not rotate on a time quantum |
-| `SCHED_RR`, priority 1..99 | FIFO-like priorities plus equal-priority time slicing | Does not make different priorities fair; slice size is kernel-configured |
-| `SCHED_DEADLINE` | Runtime/deadline/period reservation with admission control and CBS/EDF | Privilege, domain/affinity constraints, budget sizing and admission failures |
-| `cpu.weight` | Relative shares between contending eligible cgroups | Not a cap and not a FIFO/RR bandwidth control |
-| `cpu.max` | Aggregate fair-class CPU bandwidth cap | Periodic throttling can worsen tails; does not govern FIFO/RR |
-| Affinity / cpuset | Restrict eligible CPUs (and cpusets can restrict memory nodes) | Affinity alone is not exclusive ownership or IRQ isolation |
+| [`SCHED_OTHER`, nice -20..19](https://man7.org/linux/man-pages/man7/sched.7.html) | General-purpose fair scheduling; lower nice means larger relative weight | Not a CPU cap, reservation, or real-time guarantee; grouping affects comparisons |
+| [`SCHED_BATCH`](https://man7.org/linux/man-pages/man7/sched.7.html) | Noninteractive CPU-intensive work | Same fair class, different wake-up treatment; not universally faster |
+| [`SCHED_IDLE`](https://man7.org/linux/man-pages/man7/sched.7.html) | Best-effort background work that may make little progress | Can starve under contention; not the kernel's idle thread |
+| [`SCHED_FIFO`, priority 1..99](https://man7.org/linux/man-pages/man7/sched.7.html) | Fixed-priority preemption; suitable for carefully bounded periodic tasks | Can starve lower priorities; equal-priority tasks do not rotate on a time quantum |
+| [`SCHED_RR`, priority 1..99](https://man7.org/linux/man-pages/man7/sched.7.html) | FIFO-like priorities plus equal-priority time slicing | Does not make different priorities fair; slice size is kernel-configured |
+| [`SCHED_DEADLINE`](https://docs.kernel.org/scheduler/sched-deadline.html) | Runtime/deadline/period reservation with admission control and CBS/EDF | Privilege, domain/affinity constraints, budget sizing and admission failures |
+| [`cpu.weight`](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu-interface-files) | Relative shares between contending eligible cgroups | Not a cap and not a FIFO/RR bandwidth control |
+| [`cpu.max`](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu-interface-files) | Aggregate fair-class CPU bandwidth cap | Periodic throttling can worsen tails; does not govern FIFO/RR |
+| [Affinity](https://man7.org/linux/man-pages/man2/sched_setaffinity.2.html) / [cpuset](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpuset) | Restrict eligible CPUs (and cpusets can restrict memory nodes) | Affinity alone is not exclusive ownership or IRQ isolation |
 
 Policies are **per thread**. A process with several threads may have mixed policies.
-Linux nice is also per-thread in practice. A high-priority audio callback does not
+Linux [nice is also per-thread in practice](https://man7.org/linux/man-pages/man2/getpriority.2.html). A high-priority audio callback does not
 raise the priority of a helper, device IRQ, filesystem, or lock owner automatically.
 
-CFS and EEVDF are scheduler implementation designs, not additional user-facing RT
+[CFS](https://docs.kernel.org/scheduler/sched-design-CFS.html) and
+[EEVDF](https://docs.kernel.org/scheduler/sched-eevdf.html) are scheduler implementation designs, not additional user-facing RT
 policies. EEVDF virtual deadlines select among eligible fair tasks; they are not
 wall-clock guarantees. The transition began in mainline 6.6 and evolves; vendor
-backports make version-number-only inference unreliable. sched_ext can replace
+backports make version-number-only inference unreliable.
+[sched_ext](https://docs.kernel.org/scheduler/sched-ext.html) can replace
 fair scheduling when enabled and loaded; the environment snapshot records visible
 state. See [kernel/hardware comparisons](KERNELS_AND_HARDWARE.md).
 
@@ -174,6 +201,12 @@ timely service for a foreground task. Negative nice needs an appropriate
 **Exercise:** use the native interface below to compare nice 0, 5 and 15 with the
 same work. Do not compare unrelated output sizes and call it a scheduler speedup.
 Default permissions and cleanup are those of the quickstart.
+
+**Sources and further reading:** [`getpriority`/`setpriority`](https://man7.org/linux/man-pages/man2/getpriority.2.html)
+for the nice API and permissions; [`sched(7)`](https://man7.org/linux/man-pages/man7/sched.7.html)
+for OTHER/BATCH/IDLE and autogroups; [scheduler nice design](https://docs.kernel.org/scheduler/sched-nice-design.html)
+for the historical weight rationale. That last document discusses the 2.6.23
+redesign, not an exact throughput ratio promised by every current kernel.
 
 ## 5. Lab: periodic audio, video, and an offline competitor
 
@@ -209,6 +242,12 @@ baseline that comfortably fits, then intentionally exceed it. The correct result
 is a measured miss, not silently dropped work. For a real sound-device experiment,
 see [advanced experiments](ADVANCED.md#real-audio-and-video).
 
+**Sources and further reading:** [the generated DSP/frame workloads](../native/work.cpp)
+define the exact synthetic work; [PortAudio's callback constraints](https://www.portaudio.com/docs/v19-doxydocs/writing_a_callback.html)
+explain why blocking/allocation matters; [ALSA PCM states and recovery](https://www.alsa-project.org/alsa-doc/alsa-lib/pcm.html)
+define real underrun/overrun behavior. The [absolute-sleep API](https://man7.org/linux/man-pages/man2/clock_nanosleep.2.html)
+explains the release mechanism, not a guarantee of prompt dispatch.
+
 ## 6. Lab: placement and number of workers
 
 **Goal/hypothesis:** avoiding a shared logical CPU can help, but additional workers
@@ -236,6 +275,12 @@ power budgets and memory bandwidth. Placement is not CPU isolation.
 
 **Exercise:** compare a sibling, a separate physical core and (if available) a
 remote NUMA node. Record which is which before explaining the outcome.
+
+**Sources and further reading:** [`sched_setaffinity(2)`](https://man7.org/linux/man-pages/man2/sched_setaffinity.2.html)
+and [`pthread_setaffinity_np(3)`](https://man7.org/linux/man-pages/man3/pthread_setaffinity_np.3.html)
+describe eligible CPUs and per-thread placement; [CPU topology](https://docs.kernel.org/admin-guide/cputopology.html)
+and [scheduler capacity](https://docs.kernel.org/scheduler/sched-capacity.html)
+explain why logical CPU IDs need not represent equal, independent resources.
 
 ## 7. Opt-in lab: FIFO, RR and equal-priority sharing
 
@@ -277,6 +322,12 @@ hardware interference or a guarantee against a broken kernel.
 **Exercise:** inspect whether the measured batch is longer than the RR quantum.
 Change work carefully; leave the watchdog, RT throttling and priority ceilings intact.
 
+**Sources and further reading:** [FIFO/RR ordering and privilege rules](https://man7.org/linux/man-pages/man7/sched.7.html),
+[`sched_rr_get_interval`](https://man7.org/linux/man-pages/man2/sched_rr_get_interval.2.html)
+for querying the actual quantum, and [`RLIMIT_RTTIME`](https://man7.org/linux/man-pages/man2/getrlimit.2.html)
+for CPU-time accounting/reset behavior. The [guardian implementation](../native/work.cpp)
+adds the separate wall-clock check; a resource limit is not a substitute for it.
+
 ## 8. Opt-in lab: DEADLINE admission and budgets
 
 ```sh
@@ -301,6 +352,12 @@ exceeds runtime may be throttled; deadline priorities are not FIFO numbers.
 **Exercise:** use native `--runtime-us`, `--deadline-us` and `--period-us` to vary
 one budget on an authorized lab host. Do not bypass the utilization limit to
 chase a universal "best" result.
+
+**Sources and further reading:** [`sched_setattr(2)`](https://man7.org/linux/man-pages/man2/sched_setattr.2.html)
+documents the ABI, parameter validation and admission errors;
+[kernel DEADLINE documentation](https://docs.kernel.org/scheduler/sched-deadline.html)
+explains EDF/CBS, bandwidth management and scheduling-domain constraints.
+The 20% cap is a [lab safety choice](../native/work.cpp), not a kernel-wide limit.
 
 ## 9. Opt-in lab: priority inversion and inheritance
 
@@ -331,6 +388,12 @@ POSIX PI. C++20 semaphores coordinate setup outside the measured lock interval.
 application for a dependency on an ordinary-priority worker. Raising only the
 callback's priority may make that dependency worse.
 
+**Sources and further reading:** [`pthread_mutexattr_setprotocol`](https://man7.org/linux/man-pages/man3/pthread_mutexattr_setprotocol.3p.html)
+defines PI; [Linux PI futexes](https://docs.kernel.org/locking/pi-futex.html)
+explain the kernel mechanism; [`PTHREAD_EXPLICIT_SCHED`](https://man7.org/linux/man-pages/man3/pthread_attr_setinheritsched.3.html)
+explains why the thread-creation attributes matter. Runtime support and
+permission still have to be checked on the actual build.
+
 ## 10. Lab: demand faults, prefaulting and locking memory
 
 ```sh
@@ -355,6 +418,12 @@ an indiscriminate `mlockall(MCL_FUTURE)` can make later allocations fail.
 
 **Exercise:** contrast CPU-time and wall-time outliers. Do not enable whole-machine
 memory pressure or drop caches to make a demonstration more dramatic.
+
+**Sources and further reading:** [`mlock`/`mlockall`](https://man7.org/linux/man-pages/man2/mlock.2.html)
+for locking, limits and failure modes; [`mmap`](https://man7.org/linux/man-pages/man2/mmap.2.html)
+for anonymous mappings; [`getrusage`](https://man7.org/linux/man-pages/man2/getrusage.2.html)
+for the distinction between minor and major faults. None promises that
+prefaulting alone prevents future reclaim or all other latency sources.
 
 ## 11. Opt-in delegation lab: cgroup weight versus quota
 
@@ -388,6 +457,15 @@ The helper never enables a controller, changes the parent's controls, or moves
 the caller. It removes only the fresh empty leaves it created. Cleanup failure
 is an error, not ignored. Memory, I/O, cpuset/NUMA and optional systemd examples
 are in [advanced experiments](ADVANCED.md).
+
+**Sources and further reading:** [v2 CPU interface files](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu-interface-files)
+and [delegation rules](https://docs.kernel.org/admin-guide/cgroup-v2.html#delegation);
+[fair-class bandwidth control](https://docs.kernel.org/scheduler/sched-bwc.html)
+for throttling behavior; [RT group scheduling](https://docs.kernel.org/scheduler/sched-rt-group.html)
+for the separate FIFO/RR mechanism and its configuration restrictions.
+Current v2 documentation also describes weight/bandwidth callbacks for BPF
+schedulers. Their effect depends on kernel and sched_ext implementation support;
+this does not turn `cpu.weight` or `cpu.max` into FIFO/RR bandwidth controls.
 
 ## 12. Command reference and reproducibility
 
@@ -451,6 +529,15 @@ Manifests include hostname, process/boot metadata and paths. Review them before
 sharing. Reports load no remote resources. Compare uses links to original CSV
 locations; retain the source run directories or move them with an updated report.
 
+**Interface sources:** [CLI parsing and replay validation](../schedlab/__main__.py),
+[preset parameters and process cleanup](../schedlab/runner.py),
+[environment/config inspection](../schedlab/environment.py), and
+[report generation](../schedlab/report.py) are authoritative for these project
+commands. Python's [`subprocess` documentation](https://docs.python.org/3/library/subprocess.html)
+explains process/session handling and timeout behavior; in particular, `preexec_fn`
+is not safe in a multithreaded launcher, which is why this harness remains
+single-threaded.
+
 ## 13. Coverage, decisions, troubleshooting
 
 | Topic | Executable automated lab | Opt-in/manual or conceptual boundary |
@@ -499,6 +586,13 @@ worst-case execution-time bound; SMT = logical threads sharing a physical core;
 NUMA = nonuniform memory access; quota = bandwidth ceiling; weight = relative share;
 admission = deciding whether requested reservations can be accepted.
 
+**Reference paths for this matrix:** use the linked [policy definitions](#3-policy-map-what-the-knobs-actually-do),
+[permission/limit sources](ADVANCED.md#permissions-and-safety),
+[kernel/config sources](KERNELS_AND_HARDWARE.md#3-preemption-modes-and-relevant-config),
+and [device-XRUN sources](ADVANCED.md#audio-measure-a-real-xrun-do-not-rename-a-synthetic-miss)
+when diagnosing a particular row. These are decision aids, not additional
+automated workloads or guarantees.
+
 ## 14. Implementation and trustworthy sources
 
 `native/work.cpp` uses C++20 vectors/spans/arrays for preallocated buffers, RAII
@@ -511,9 +605,13 @@ engines would introduce extra differences into comparisons.
 
 The policy/getparam/setpolicy wrapper intentionally uses named `SYS_sched_*`
 constants from the target's headers, never architecture-numbered syscalls.
-Several [musl libc scheduler wrappers](https://git.musl-libc.org/cgit/musl/tree/src/sched)
-are `ENOSYS` stubs; calling the Linux per-thread syscalls directly provides the
-intended semantics on both libcs without pretending an unavailable call succeeded.
+For a versioned example, musl v1.2.5's
+[`sched_getscheduler`](https://git.musl-libc.org/cgit/musl/tree/src/sched/sched_getscheduler.c?h=v1.2.5),
+[`sched_getparam`](https://git.musl-libc.org/cgit/musl/tree/src/sched/sched_getparam.c?h=v1.2.5) and
+[`sched_setscheduler`](https://git.musl-libc.org/cgit/musl/tree/src/sched/sched_setscheduler.c?h=v1.2.5)
+are `ENOSYS` stubs; check the [current source directory](https://git.musl-libc.org/cgit/musl/tree/src/sched)
+for other releases. Calling the Linux per-thread syscalls directly provides the
+intended semantics without pretending an unavailable libc call succeeded.
 
 `schedlab/` contains only standard-library Python: orchestration, read-only
 inspection, metric math, reporting and delegated cgroup lifecycle.
@@ -522,6 +620,13 @@ requested/effective settings, faults, skips and watchdog/process-group cleanup.
 CI builds/tests GCC and Clang, and tests a static Alpine-built musl native core
 on the host (with the host's Python harness), plus architecture builds. Cross-compilation
 is not native execution and no hosted runner certifies real-time performance.
+
+**Build/test sources:** the [checked-in workflow](../.github/workflows/ci.yml)
+specifies the actual matrix and commands; [GitHub-hosted runner documentation](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+describes the execution platforms; [workflow artifacts](https://docs.github.com/en/actions/using-workflows/storing-workflow-data-as-artifacts)
+explain report retention/downloads. [GCC cross-toolchain configuration](https://gcc.gnu.org/install/configure.html)
+distinguishes build/host/target systems. The [test suite](../tests/test_lab.py)
+shows which assertions are exercised and which checks require explicit opt-in.
 
 Normative references:
 

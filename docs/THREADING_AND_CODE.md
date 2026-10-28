@@ -8,24 +8,28 @@ avoid, and where the runnable examples make those choices.
 
 | Requirement | Prefer | Why / caveat |
 |---|---|---|
-| Owned background worker with cooperative cancellation | C++20 `std::jthread` and `std::stop_token` | Scope-bound lifetime; no forgotten join. Stop is cooperative, not forced interruption |
-| Ordinary mutex/condition coordination outside a callback | `std::mutex`, `std::unique_lock`, `std::condition_variable[_any]` | Explicit ownership and predicate-based waits; not a bounded RT blocking guarantee |
-| Setup barrier, handoff or counted permits | `std::latch`, `std::barrier`, `std::counting_semaphore` as appropriate | Clear coordination, but waits can block; keep them out of deadline paths unless justified |
-| Linux thread policy/affinity/limits | Target-thread Linux APIs during setup | ISO C++ has no RT policy/priority/affinity abstraction |
-| FIFO threads that must never execute user work under the wrong initial policy | `pthread_create` with explicit scheduling attributes | Avoids the create-then-retune race; check every attribute/create error |
-| A shared mutex that needs priority inheritance | A pthread mutex configured with `PTHREAD_PRIO_INHERIT` | `std::mutex` cannot portably request PI; PI does not eliminate deadlock or long waits |
-| Small fixed one-producer/one-consumer transfer | Preallocated bounded SPSC queue with a documented memory-order protocol | Nonblocking producer; **not** a general MPMC container |
-| Independent offline CPU work | A bounded worker pool / fixed owned workers | Avoid creating one thread per job or per input frame |
-| Audio callback created by a server/driver | That API's existing callback thread and rules | Do not add a sleeping user thread as a substitute for the device clock |
+| Owned background worker with cooperative cancellation | C++20 [`std::jthread`](https://en.cppreference.com/w/cpp/thread/jthread.html) and [`std::stop_token`](https://en.cppreference.com/w/cpp/thread/stop_token.html) | Scope-bound lifetime; no forgotten join. Stop is cooperative, not forced interruption |
+| Ordinary mutex/condition coordination outside a callback | [`std::mutex`](https://en.cppreference.com/w/cpp/thread/mutex.html), [`std::unique_lock`](https://en.cppreference.com/w/cpp/thread/unique_lock.html), [`std::condition_variable_any`](https://en.cppreference.com/w/cpp/thread/condition_variable_any.html) | Explicit ownership and predicate-based waits; not a bounded RT blocking guarantee |
+| Setup barrier, handoff or counted permits | [`std::latch`](https://en.cppreference.com/w/cpp/thread/latch.html), [`std::barrier`](https://en.cppreference.com/w/cpp/thread/barrier.html), [`std::counting_semaphore`](https://en.cppreference.com/w/cpp/thread/counting_semaphore.html) as appropriate | Clear coordination, but waits can block; keep them out of deadline paths unless justified |
+| Linux thread policy/affinity/limits | [Target-thread Linux APIs](https://man7.org/linux/man-pages/man7/sched.7.html) during setup | ISO C++ has no RT policy/priority/affinity abstraction |
+| FIFO threads that must never execute user work under the wrong initial policy | [`pthread_create`](https://man7.org/linux/man-pages/man3/pthread_create.3.html) with [explicit scheduling attributes](https://man7.org/linux/man-pages/man3/pthread_attr_setinheritsched.3.html) | Avoids the create-then-retune race; check every attribute/create error |
+| A shared mutex that needs priority inheritance | A pthread mutex configured with [`PTHREAD_PRIO_INHERIT`](https://man7.org/linux/man-pages/man3/pthread_mutexattr_setprotocol.3p.html) | `std::mutex` cannot portably request PI; PI does not eliminate deadlock or long waits |
+| Small fixed one-producer/one-consumer transfer | [Preallocated bounded SPSC queue](../native/pipeline.cpp) with a documented [memory-order protocol](https://en.cppreference.com/w/cpp/atomic/memory_order.html) | Nonblocking producer; **not** a general MPMC container |
+| Independent offline CPU work | A bounded worker pool / fixed owned workers; see [Core Guidelines CP.41](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#cp41-minimize-thread-creation-and-destruction) | Avoid creating one thread per job or per input frame |
+| Audio callback created by a server/driver | That API's existing callback thread and [callback rules](https://www.portaudio.com/docs/v19-doxydocs/writing_a_callback.html) | Do not add a sleeping user thread as a substitute for the device clock |
 
-`std::async` can choose deferred execution, allocate and synchronize unexpectedly;
-it is not a callback-safe scheduling policy. `std::execution::par` does not give
+[`std::async`](https://en.cppreference.com/w/cpp/thread/async.html) can choose deferred execution, allocate and synchronize unexpectedly;
+it is not a callback-safe scheduling policy. [`std::execution::par`](https://en.cppreference.com/w/cpp/algorithm/execution_policy_tag_t.html) does not give
 you per-worker Linux priorities or a known bounded worker count. Do not equate
 "modern C++" with "RT-safe by default".
 
 The native RT core uses POSIX attributes for its PI demonstration because they
 express the required initialization contract. Elsewhere, prefer C++ ownership
 and data structures rather than manually managing raw thread lifetimes.
+
+**Version note:** the examples use C++20 interfaces. The reference pages also
+describe later-standard additions; those additions are not requirements or
+promises about this lab's compiler/library combinations.
 
 ## 2. Runnable C++20 pipeline
 
@@ -80,6 +84,13 @@ The example shares its WAV serializer with the timing core; it is not
 used to claim language-versus-language scheduling differences. There is no C
 version because a C wrapper would not demonstrate a different Linux policy.
 
+**Sources and further reading:** [acquire/release publication](https://en.cppreference.com/w/cpp/atomic/memory_order.html),
+[target-dependent atomic lock freedom](https://en.cppreference.com/w/cpp/atomic/atomic/is_always_lock_free.html),
+and [`jthread::join`](https://en.cppreference.com/w/cpp/thread/jthread/join.html)
+explain the relevant contracts. The [queue and completion protocol in this example](../native/pipeline.cpp)
+must still be reviewed as a whole; knowing that an index is atomic does not prove
+the algorithm or object lifetimes correct.
+
 ## 3. Design the processing path before selecting priority
 
 **Separate responsibilities.** A device callback should consume ready input,
@@ -125,6 +136,15 @@ define lock ordering and avoid holding a lock across I/O or callbacks.
 Inheritance can boost a lock owner but cannot guarantee the duration of its work.
 Do not assume PI on a default `std::mutex`.
 
+**Callback/code sources:** [PortAudio's callback restrictions](https://www.portaudio.com/docs/v19-doxydocs/writing_a_callback.html)
+and [JACK's process-callback contract](https://jackaudio.org/api/group__ClientCallbacks.html)
+explain the blocking/allocation concern. [`vector::reserve`](https://en.cppreference.com/w/cpp/container/vector/reserve.html)
+and [`span`](https://en.cppreference.com/w/cpp/container/span.html) document capacity
+and nonownership; [`mlock`](https://man7.org/linux/man-pages/man2/mlock.2.html)
+and [PI mutex protocols](https://man7.org/linux/man-pages/man3/pthread_mutexattr_setprotocol.3p.html)
+cover the separate OS mechanisms. A queue's capacity and overflow policy remain
+application design choices, not defaults supplied by those APIs.
+
 ## 4. Correct cancellation, errors and lifetime
 
 Threads are resources. Define who starts, stops and joins each thread, and which
@@ -151,6 +171,13 @@ failing file output is after joining. Main reports thread construction/join and
 allocation failures. The RT engine independently checks system-call errors and
 uses structured skipped/error results. Neither silently relabels OTHER as FIFO.
 
+**Lifetime/error sources:** [`jthread` destruction and stop requests](https://en.cppreference.com/w/cpp/thread/jthread.html),
+[stop-aware condition-variable waits](https://en.cppreference.com/w/cpp/thread/condition_variable_any/wait.html),
+[thread-function exception behavior](https://en.cppreference.com/w/cpp/thread/thread/thread.html),
+and [`promise::set_exception`](https://en.cppreference.com/w/cpp/thread/promise/set_exception.html)
+for an off-callback error channel. [Core Guidelines CP.26](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#cp26-dont-detach-a-thread)
+explains the lifetime risks of detaching.
+
 ## 5. Thread count, placement and dependencies
 
 Start with the minimum pipeline that expresses actual parallelism. Budget
@@ -175,6 +202,13 @@ affinity or "lock-free" rewrites without measuring the actual contention.
 Lock-free means a progress property, not wait-free per-operation latency or a
 hard-RT guarantee; it also says nothing about the latency of the surrounding
 memory subsystem.
+
+**Placement/dependency sources:** [`pthread_create`](https://man7.org/linux/man-pages/man3/pthread_create.3.html)
+documents inherited thread attributes; [`pthread_setaffinity_np`](https://man7.org/linux/man-pages/man3/pthread_setaffinity_np.3.html)
+and [`pthread_getschedparam`](https://man7.org/linux/man-pages/man3/pthread_getschedparam.3.html)
+cover setting/reading the actual thread state.
+[PREEMPT_RT execution-context differences](https://docs.kernel.org/core-api/real-time/differences.html)
+explain why IRQ/helper context matters independently of the callback policy.
 
 ## 6. Choosing priorities: a policy, not a magic number
 
@@ -221,6 +255,14 @@ Read effective settings back (`pthread_getschedparam`, Linux scheduler APIs,
 `getpriority`, affinity) and retain them with the measurements. Return permission
 errors as errors/skips; never silently relabel an ordinary thread as RT.
 
+**Priority sources:** [`sched(7)`](https://man7.org/linux/man-pages/man7/sched.7.html)
+defines policy ordering, static priorities and permissions;
+[`getpriority(2)`](https://man7.org/linux/man-pages/man2/getpriority.2.html) defines
+the different nice scale; [DEADLINE bandwidth rules](https://docs.kernel.org/scheduler/sched-deadline.html)
+define reservation parameters; [PI protocols](https://man7.org/linux/man-pages/man3/pthread_mutexattr_setprotocol.3p.html)
+address lock-owner dependencies. The role-based starting points above are
+recommendations for measurement, not numeric priorities mandated by these sources.
+
 ## 7. How many threads? Budget capacity, not just logical CPUs
 
 There is no universally correct "one thread per core" rule. Distinguish:
@@ -261,6 +303,13 @@ throughput or latency; NUMA workers can become memory-bandwidth-bound. Extra
 threads may increase power enough to lower sustained frequency. A useful count
 is therefore specific to workload, topology, quota and thermal operating point.
 
+**Capacity sources:** [`hardware_concurrency` is only a hint](https://en.cppreference.com/w/cpp/thread/thread/hardware_concurrency.html),
+[cgroup CPU bandwidth is hierarchical](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu-interface-files),
+and [scheduler capacity](https://docs.kernel.org/scheduler/sched-capacity.html)
+describes asymmetric resources. For library-level thread controls, consult the
+[OpenMP 5.2 environment-variable specification](https://www.openmp.org/spec-html/5.2/openmpch21.html);
+do not assume every library uses OpenMP or the same environment variables.
+
 ### A thread-count experiment you can defend
 
 For a **strong-scaling** comparison, keep total input and processing work fixed,
@@ -284,6 +333,12 @@ count, thread policy/affinity, completion time, total CPU time, per-stage queue
 high-water/overflow, context switches, foreground p99/misses, quota throttling
 and temperature. Hold chunk size, output quality and library-internal parallelism
 constant unless that is the variable being studied. Include a serial baseline.
+
+**Measurement/scaling reference:** LLNL's [Introduction to Parallel Computing](https://hpc.llnl.gov/documentation/tutorials/introduction-parallel-computing-tutorial)
+defines strong/weak scaling, observed speedup, granularity and parallel overhead.
+The [lab metric implementation](../schedlab/metrics.py) and
+[preset definitions](../schedlab/runner.py) establish which of those quantities
+these particular commands actually measure.
 
 ## 8. Choose a parallelization strategy
 
@@ -314,6 +369,13 @@ work-stealing runtime is not automatically suitable for a callback with a tight
 deadline. Prefer mature, measured runtimes for this complexity rather than a
 home-grown lock-free scheduler.
 
+**Scheduling-strategy sources:** [LLNL's partitioning, load-balancing and granularity discussion](https://hpc.llnl.gov/documentation/tutorials/introduction-parallel-computing-tutorial)
+supports the static/dynamic tradeoffs. The oneTBB guides describe
+[chunk/partitioner choices](https://uxlfoundation.github.io/oneTBB/main/tbb_userguide/Partitioner_Summary.html)
+and [task scheduling/work stealing](https://uxlfoundation.github.io/oneTBB/main/tbb_userguide/How_Task_Scheduler_Works.html).
+They are further-reading examples of a mature offline runtime, not a dependency
+of this project or an endorsement for hard-RT callbacks.
+
 For audio, per-channel parallelism may be independent, but an IIR filter's state
 depends on prior samples; do not split its time sequence into unordered chunks.
 FFT/block processing has overlap/windowing and algorithmic-delay requirements.
@@ -325,6 +387,12 @@ Keep worker-local scratch buffers and ownership wherever possible. Separate
 immutable input from disjoint output ranges. A reduction/aggregation phase
 needs an explicit synchronization boundary; don't read partially written
 results just because task indices were atomic.
+
+**Data-dependency references:** SciPy's [IIR/FIR state equations and initial/final state](https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.lfilter.html)
+and [overlap-add convolution](https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.oaconvolve.html)
+provide concrete DSP background; neither Python nor SciPy runs in this lab's
+measured callbacks. For pipeline/data/task decomposition more generally, see
+[LLNL's parallel-program design examples](https://hpc.llnl.gov/documentation/tutorials/introduction-parallel-computing-tutorial).
 
 ## 9. Choose a synchronization strategy
 
@@ -363,6 +431,17 @@ queue churn, migrations and lock wait can erase a parallel speedup. Profile them
 on the actual target, changing one design choice at a time. Do not prescribe
 cache-line padding or memory-order weakening as universal optimizations.
 
+**Synchronization sources:** [Core Guidelines CP.20/21/22/42](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#s-concurrency)
+cover ownership, lock ordering, unknown callbacks and wait predicates;
+[atomic wait](https://en.cppreference.com/w/cpp/atomic/atomic/wait.html),
+[barriers](https://en.cppreference.com/w/cpp/thread/barrier.html) and
+[semaphores](https://en.cppreference.com/w/cpp/thread/counting_semaphore.html)
+describe distinct blocking protocols. The
+[atomic shared-pointer contract](https://en.cppreference.com/w/cpp/memory/shared_ptr/atomic2.html)
+explains lock freedom and destruction sequencing; it is not a universal callback-safe
+reclamation mechanism. The [PI mutex specification](https://man7.org/linux/man-pages/man3/pthread_mutexattr_setprotocol.3p.html)
+applies when that OS protocol is explicitly selected.
+
 ## 10. Review checklist
 
 Before trying a higher scheduling priority, verify:
@@ -381,9 +460,17 @@ build. They change execution/memory behavior, so **do not use instrumented timin
 as RT evidence**. Sanitizers also do not prove a lock-free algorithm correct;
 review its memory model, publication and ownership invariants.
 
+**Tool references:** Clang's [AddressSanitizer](https://clang.llvm.org/docs/AddressSanitizer.html),
+[UndefinedBehaviorSanitizer](https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html)
+and [ThreadSanitizer](https://clang.llvm.org/docs/ThreadSanitizer.html) document
+usage, overhead and supported platforms. For hardware-counter measurements,
+[`perf stat`](https://man7.org/linux/man-pages/man1/perf-stat.1.html) is useful
+further reading; PMU access and event availability are kernel/hardware dependent.
+These are optional diagnostic techniques, not additional CI performance gates.
+
 ## Further reading
 
-- [C++ Core Guidelines: concurrency](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#S-concurrency)
+- [C++ Core Guidelines: concurrency](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#s-concurrency)
 - [`std::jthread`](https://en.cppreference.com/w/cpp/thread/jthread.html)
 - [`std::stop_token`](https://en.cppreference.com/w/cpp/thread/stop_token.html)
 - [`std::span`](https://en.cppreference.com/w/cpp/container/span.html)

@@ -1,0 +1,63 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            compiler: g++
+          - os: ubuntu-24.04
+            compiler: clang++
+          - os: ubuntu-24.04-arm
+            compiler: g++
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: C++20 build and bounded unprivileged tests (native architecture)
+        run: make test CXX=${{ matrix.compiler }}
+      - name: Produce example report (not a performance gate)
+        run: python3 -m schedlab run quick --repetitions 1 --out results/ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.os }}-${{ matrix.compiler }}
+          path: results/ci/
+          retention-days: 7
+
+  musl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build static musl C++20 binary in Alpine
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.20 sh -ec '
+            apk add --no-cache g++ make python3
+            make CXX=g++ LDFLAGS=-static
+          '
+      - name: Test musl core on the host (no container scheduler/seccomp assumptions)
+        run: python3 -m unittest discover -s tests -v
+
+  cross-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        target: [aarch64-linux-gnu, riscv64-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install distribution cross toolchain
+        run: sudo apt-get update -qq && sudo apt-get install -y g++-${{ matrix.target }}
+      - name: Compile only (not native execution or RT validation)
+        run: make CXX=${{ matrix.target }}-g++

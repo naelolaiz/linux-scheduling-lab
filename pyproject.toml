@@ -42,7 +42,7 @@ help = "Generate build/$SCHEDLAB_PRESET from CMakePresets.json"
 cmd = "cmake --preset ${SCHEDLAB_PRESET}"
 
 [tool.poe.tasks.build]
-help = "Configure and compile sched-work and thread-pipeline"
+help = "Configure and compile sched-work, sched-load and thread-pipeline"
 sequence = ["configure", { cmd = "cmake --build --preset ${SCHEDLAB_PRESET} --parallel" }]
 
 [tool.poe.tasks.test]

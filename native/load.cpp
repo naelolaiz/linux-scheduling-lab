@@ -185,6 +185,14 @@ int default_threads(LoadKind kind, std::size_t cpus) {
     }
 }
 
+// Sorted, without repeats. std::unique rather than std::ranges::unique: Clang 14 cannot use the
+// subrange that libstdc++ 11 returns.
+std::vector<int> distinct_cpus(std::vector<int> cpus) {
+    std::ranges::sort(cpus);
+    cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end()); // NOLINT(modernize-use-ranges)
+    return cpus;
+}
+
 // The first error any worker hit; workers record, the main thread reports.
 class Errors {
 public:
@@ -532,11 +540,7 @@ int run(const Options &options) {
     }
     if (options.kind == LoadKind::rt) {
         if (!options.allow_rt) return report_skip("RT load requires explicit --allow-rt");
-        std::vector<int> unique = options.cpus;
-        std::ranges::sort(unique);
-        const auto duplicates = std::ranges::unique(unique);
-        unique.erase(duplicates.begin(), duplicates.end());
-        if (static_cast<int>(unique.size()) >= CPU_COUNT(&allowed))
+        if (static_cast<int>(distinct_cpus(options.cpus).size()) >= CPU_COUNT(&allowed))
             return report_skip("RT load must leave at least one allowed CPU without RT load");
         rlimit limit = {200000, 500000};
         rlimit old{};
@@ -640,9 +644,7 @@ int run(const Options &options) {
         fsync_ns += worker.fsync_ns;
         fsyncs += worker.fsyncs;
     }
-    std::vector<int> distinct = options.cpus;
-    std::ranges::sort(distinct);
-    distinct.erase(std::ranges::unique(distinct).begin(), distinct.end());
+    const std::vector<int> distinct = distinct_cpus(options.cpus);
     {
         lab::json::Object result(std::cout);
         result.field("schema_version", 1).field("status", "ok").field("kind", kind_name(options.kind));

@@ -62,6 +62,9 @@ using lab::SchedulingPolicy;
 using lab::sleep_until;
 namespace thread_scheduler = lab::thread_scheduler;
 
+// Keeps the prewarm loop's result observable so the compiler cannot drop the work.
+volatile std::uint32_t prewarm_sink = 0;
+
 constexpr int WIDTH = 160;
 constexpr int HEIGHT = 90;
 constexpr int PIXELS = WIDTH * HEIGHT;
@@ -90,6 +93,7 @@ struct Options {
     int deadline_us = 10000;
     int duration_ms = 0;
     int timeout_ms = 8000;
+    int prewarm_ms = 0;
     std::uint64_t start_ns = 0;
 };
 struct Sample {
@@ -192,6 +196,7 @@ void usage() {
                  "  --start-ns MONOTONIC_NS --timeout-ms 100..15000\n"
                  "  --allow-rt --priority 1..20 --runtime-us N --deadline-us N\n"
                  "  --memory demand|prefault|mlock --protocol none|inherit\n"
+                 "  --prewarm-ms 0..1000 (busy the CPU before the first release, so it starts at speed)\n"
                  "sched-work --build-info prints the compiler, flags and libraries of this binary.\n"
                  "Values follow the option (--jobs 40) or an equals sign (--jobs=40).\n"
                  "Default: 40 jobs, 4 filter passes, 10ms audio / 30ms video period.\n"
@@ -250,6 +255,7 @@ constexpr std::array option_table{
     OptionSpec{"deadline-us", true, integer_option<&Options::deadline_us, 1000, 100000>},
     OptionSpec{"duration-ms", true, integer_option<&Options::duration_ms, 0, 10000>},
     OptionSpec{"timeout-ms", true, integer_option<&Options::timeout_ms, 100, 15000>},
+    OptionSpec{"prewarm-ms", true, integer_option<&Options::prewarm_ms, 0, 1000>},
     OptionSpec{"start-ns", true, start_option},
 };
 
@@ -703,8 +709,24 @@ int worker(const Options &options) {
     const std::uint64_t origin = options.start_ns ? options.start_ns : now + 20000000ULL;
     if (origin < now || origin - now > 2000000000ULL)
         return report_error("start-ns must be in the next two seconds (warmup may have overrun it)");
-    // Opened before the initial sleep so that reading counters never delays the first job.
-    lab::schedstat::Window contention(options.cpu, now);
+    // The contention window opens 2 ms before the first release, so reading counters never delays
+    // the first job and the time before it (including any prewarm) stays outside the window.
+    constexpr std::uint64_t window_lead_ns = 2000000;
+    const std::uint64_t open_at = origin - now > window_lead_ns ? origin - window_lead_ns : now;
+    if (options.prewarm_ms) {
+        // Keep this CPU busy up to the window so the clock does not start from idle.
+        const std::uint64_t prewarm_ns = static_cast<std::uint64_t>(options.prewarm_ms) * 1000000;
+        if (open_at - now > prewarm_ns && sleep_until(open_at - prewarm_ns))
+            return report_error("initial sleep interrupted");
+        std::uint32_t state = 1;
+        for (auto clock = read_clock(CLOCK_MONOTONIC); clock && clock.nanoseconds < open_at && !interrupted;
+             clock = read_clock(CLOCK_MONOTONIC))
+            for (int step = 0; step < 1024; step++) state = state * 1664525U + 1013904223U;
+        prewarm_sink = state;
+    } else if (sleep_until(open_at)) {
+        return report_error("initial sleep interrupted");
+    }
+    lab::schedstat::Window contention(options.cpu, open_at);
     if (sleep_until(origin)) return report_error("initial sleep interrupted");
     rusage before{};
     rusage after{};

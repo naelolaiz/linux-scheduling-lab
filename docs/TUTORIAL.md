@@ -495,6 +495,7 @@ The `uv run poe …` forms are optional shortcuts for the plain commands beside 
 | `python3 -m unittest discover -s tests -v`, `uv run poe test` | Unprivileged correctness/integration tests (`poe test` builds first) |
 | `cmake --build --preset P --target clean`, `uv run poe clean` | Remove the built native executables |
 | `SCHEDLAB_NATIVE_DIR=build/P`, `SCHEDLAB_PRESET=P` | Use a non-default build for tests and runs (the latter for `poe` tasks) |
+| `uv run poe format`, `uv run poe lint` | Apply / check ruff, clang-format and clang-tidy at locked versions; `lint` configures `build/P` for its compile database |
 | `python3 -m schedlab doctor [--out FILE]` | Read-only inventory; unknown/unreadable facts remain explicit |
 | `python3 -m schedlab run PRESET` | Run any preset from `--help`; generate a fresh result directory |
 | `--repetitions N` | 1..10 repetitions, default 3 |

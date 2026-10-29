@@ -15,8 +15,15 @@ def main():
         (Path(sys.argv[1]) / "cgroup.procs").write_text(str(os.getpid()))
     except OSError as exc:
         skipped = exc.errno in (errno.EPERM, errno.EACCES, errno.EROFS, errno.ENOENT)
-        print(json.dumps({"schema_version": 1, "status": "skipped" if skipped else "error",
-                          "reason": "join delegated cgroup: %s" % exc}))
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "skipped" if skipped else "error",
+                    "reason": "join delegated cgroup: %s" % exc,
+                }
+            )
+        )
         return 77 if skipped else 1
     os.execv(sys.argv[2], sys.argv[2:])
 

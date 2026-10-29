@@ -36,6 +36,10 @@ python3 -m schedlab run quick --repetitions 1 --out results/first
 
 Other presets build side by side in `build/<preset>`: `SCHEDLAB_PRESET=clang uv run poe test`,
 or `SCHEDLAB_NATIVE_DIR=build/clang python3 -m schedlab …` after a plain `clang` build.
+`uv run poe format` and `uv run poe lint` apply and check [ruff](https://docs.astral.sh/ruff/),
+[clang-format](https://clang.llvm.org/docs/ClangFormat.html) and
+[clang-tidy](https://clang.llvm.org/extra/clang-tidy/) (configured in `pyproject.toml`,
+`.clang-format` and `.clang-tidy`; versions locked in `uv.lock`).
 
 **Start with the [tutorial](docs/TUTORIAL.md).** It explains each hypothesis,
 command, measurement, tradeoff, permission and exercise. Continue with the

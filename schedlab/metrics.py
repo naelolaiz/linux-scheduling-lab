@@ -20,8 +20,13 @@ def quantile(values, q):
 def distribution(values):
     if not values:
         return {"n": 0, "p50": None, "p95": None, "p99": None, "max": None}
-    return {"n": len(values), "p50": quantile(values, .5),
-            "p95": quantile(values, .95), "p99": quantile(values, .99), "max": max(values)}
+    return {
+        "n": len(values),
+        "p50": quantile(values, 0.5),
+        "p95": quantile(values, 0.95),
+        "p99": quantile(values, 0.99),
+        "max": max(values),
+    }
 
 
 def summarize(path, core):
@@ -48,13 +53,17 @@ def summarize(path, core):
         deadline = period
     misses = sum(value > deadline for value in response) if period else None
     elapsed = core.get("window_ns") or (rows[-1]["finish_ns"] - rows[0]["release_ns"])
-    completed = sum(r["finish_ns"] <= rows[0]["release_ns"]+elapsed for r in rows) if rows else 0
+    completed = sum(r["finish_ns"] <= rows[0]["release_ns"] + elapsed for r in rows) if rows else 0
     return {
-        "samples": len(rows), "wall_processing_ns": distribution(wall),
+        "samples": len(rows),
+        "wall_processing_ns": distribution(wall),
         "cpu_processing_ns": distribution([r["cpu_ns"] for r in rows]),
-        "response_ns": distribution(response), "wake_lateness_ns": distribution(wake),
-        "deadline_misses": misses, "miss_fraction": misses / len(rows) if period else None,
-        "elapsed_ns": elapsed, "cpu_total_ns": sum(r["cpu_ns"] for r in rows),
+        "response_ns": distribution(response),
+        "wake_lateness_ns": distribution(wake),
+        "deadline_misses": misses,
+        "miss_fraction": misses / len(rows) if period else None,
+        "elapsed_ns": elapsed,
+        "cpu_total_ns": sum(r["cpu_ns"] for r in rows),
         "completed_within_window": completed,
         "throughput_jobs_s": completed * 1e9 / elapsed if elapsed else 0,
         "first_start_ns": rows[0]["start_ns"] if rows else None,

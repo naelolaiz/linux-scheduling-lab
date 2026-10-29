@@ -57,8 +57,10 @@ make test
 python3 -m schedlab run quick --repetitions 1 --out results/first
 ```
 
-Open `results/first/report.html` directly in a browser. It contains embedded plots
-and needs no web server. The directory also contains:
+Open `results/first/report.html` directly in a browser. Its interactive dashboard
+has run/status/policy filters, selectable metric rankings, latency-tail plots,
+sortable evidence tables, and dark/light themes. It needs no web server or remote
+assets. The directory also contains:
 
 | File | Meaning |
 |---|---|
@@ -67,7 +69,7 @@ and needs no web server. The directory also contains:
 | `*.stdout` | Original native JSON result, useful for debugging the parser |
 | `audio-*.wav` | Actual generated, filtered mono PCM audio at 48 kHz |
 | `video-*.pgm`, `offline-*.pgm` | Last generated/filtered 160x90 grayscale frame |
-| `report.html` | Self-contained human-readable analysis |
+| `report.html` | Self-contained interactive visualization and human-readable analysis |
 
 The audio file can be played with any WAV player; playback is not measured.
 The image is PGM, not an encoded movie. These artifacts are not placeholders:
@@ -100,7 +102,7 @@ For each periodic job the native code records:
 | Response time | Finish minus release; captures both wake delay and processing |
 | Deadline miss | Finish strictly after release plus relative deadline |
 | Throughput | Completed jobs per elapsed second; see fixed-window distinction below |
-| Faults/context switches | [`getrusage`](https://man7.org/linux/man-pages/man2/getrusage.2.html) deltas across the measured run, not setup or file output |
+| Faults/context switches | [`getrusage`](https://man7.org/linux/man-pages/man2/getrusage.2.html) deltas across the measured run, not setup or file output; fields are `null` and `rusage_available` is false if collection fails |
 
 Audio/video releases advance by a fixed period, even after a miss. Late jobs are
 processed in sequence, not silently dropped or rescheduled from "now". Thus an

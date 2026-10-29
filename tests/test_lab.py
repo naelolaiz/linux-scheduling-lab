@@ -154,6 +154,15 @@ class NativeTests(unittest.TestCase):
         self.assertIn("watchdog", json.loads(result.stdout)["reason"])
         self.assertLess(time.monotonic()-begin, 3)
 
+    @unittest.skipUnless(Path("/dev/full").exists(), "requires the Linux full device")
+    def test_stdout_failure_is_not_success(self):
+        with Path("/dev/full").open("wb") as full:
+            result = subprocess.run(
+                [str(BINARY), "--output", str(self.prefix), "--jobs", "1"],
+                stdout=full, stderr=subprocess.PIPE, text=True, timeout=18)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("standard output", result.stderr)
+
     def test_requested_policy_in_permission_skip(self):
         result = self.invoke("--nice", "-20", "--jobs", "1")
         if result.returncode == 0:
@@ -205,10 +214,18 @@ class HarnessTests(unittest.TestCase):
             self.assertTrue((output / "run.json").is_file())
             text = (output / "report.html").read_text()
             self.assertIn("not hardware XRUNs", text)
+            self.assertIn("Schedlab / Result explorer", text)
+            self.assertIn('id="ranking"', text)
+            self.assertIn("const REPORT_DATA =", text)
+            self.assertNotRegex(text, r"@@[A-Z0-9_]+@@")
             self.assertNotIn("<script src=", text)
             manifest["title"] = "<script>alert(1)</script>"
+            manifest["runs"][0]["artifact_prefix"] = "javascript:alert(1)"
             write_report(manifest, root / "escaped.html")
-            self.assertIn("&lt;script&gt;", (root / "escaped.html").read_text())
+            escaped = (root / "escaped.html").read_text()
+            self.assertIn("&lt;script&gt;", escaped)
+            self.assertNotIn("<script>alert(1)</script>", escaped)
+            self.assertNotIn("href='javascript:", escaped)
             compare([output, output / "run.json"], root / "comparison")
             combined = json.loads((root / "comparison/run.json").read_text())
             self.assertEqual(len(combined["runs"]), 6)
@@ -329,6 +346,21 @@ class PipelineTests(unittest.TestCase):
                 [str(ROOT / "build/thread-pipeline"), "--output", "/dev/null", "--buffers", value],
                 capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 2)
+
+    @unittest.skipUnless(Path("/dev/full").exists(), "requires the Linux full device")
+    def test_pipeline_write_failures_are_not_success(self):
+        media_failure = subprocess.run(
+            [str(ROOT / "build/thread-pipeline"), "--output", "/dev/full", "--buffers", "1"],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(media_failure.returncode, 1)
+
+        with tempfile.TemporaryDirectory() as directory, Path("/dev/full").open("wb") as full:
+            output_failure = subprocess.run(
+                [str(ROOT / "build/thread-pipeline"), "--output", str(Path(directory) / "ok.wav"),
+                 "--buffers", "1"],
+                stdout=full, stderr=subprocess.PIPE, text=True, timeout=5)
+        self.assertEqual(output_failure.returncode, 1)
+        self.assertIn("standard output", output_failure.stderr)
 
 
 if __name__ == "__main__":

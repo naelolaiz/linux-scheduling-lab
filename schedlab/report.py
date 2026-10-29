@@ -1,110 +1,185 @@
-"""Self-contained HTML: no network requests, JS libraries or plotting dependencies."""
+"""Self-contained, interactive HTML reports with no network dependencies."""
 
 import html
 import json
 from pathlib import Path
+import re
 import statistics
+from urllib.parse import urlsplit
+
+
+TEMPLATE = Path(__file__).with_name("report_template.html")
+
+
+def _milliseconds(distribution, key):
+    value = distribution.get(key) if distribution else None
+    return value / 1e6 if value is not None else None
+
+
+def _artifact_link(run):
+    prefix = str(run.get("artifact_prefix", ""))
+    if not prefix or any(ord(character) < 32 for character in prefix):
+        return None
+    target = prefix + ".csv"
+    try:
+        parsed = urlsplit(target)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("", "file") or (not parsed.scheme and target.startswith("//")):
+        return None
+    return target
+
+
+def _view(run, index):
+    metrics = run.get("metrics", {}) if run.get("status") == "ok" else {}
+    core = run.get("core", {})
+    effective = core.get("effective", {})
+    wall = metrics.get("wall_processing_ns", {})
+    misses = metrics.get("deadline_misses")
+    miss_fraction = metrics.get("miss_fraction")
+    p50 = _milliseconds(wall, "p50")
+    p99 = _milliseconds(wall, "p99")
+    affinity = effective.get("affinity", [])
+    return {
+        "index": index,
+        "label": str(run.get("label", "run %d" % (index+1))),
+        "case": str(run.get("case", "unknown")),
+        "repetition": run.get("repetition"),
+        "status": str(run.get("status", "error")),
+        "reason": str(run.get("reason", "")),
+        "link": _artifact_link(run),
+        "policy": str(effective.get("policy", "unavailable")),
+        "nice": effective.get("nice"),
+        "priority": effective.get("priority"),
+        "affinity": affinity if isinstance(affinity, list) else [],
+        "mode": str(core.get("mode", run.get("parameters", {}).get("mode", "unknown"))),
+        "samples": metrics.get("samples", 0),
+        "wall_p50_ms": p50,
+        "wall_p95_ms": _milliseconds(wall, "p95"),
+        "wall_p99_ms": p99,
+        "wall_max_ms": _milliseconds(wall, "max"),
+        "cpu_p99_ms": _milliseconds(metrics.get("cpu_processing_ns", {}), "p99"),
+        "response_p99_ms": _milliseconds(metrics.get("response_ns", {}), "p99"),
+        "wake_p99_ms": _milliseconds(metrics.get("wake_lateness_ns", {}), "p99"),
+        "throughput": metrics.get("throughput_jobs_s"),
+        "deadline_misses": misses,
+        "miss_percent": miss_fraction*100 if miss_fraction is not None else None,
+        "tail_ratio": p99/p50 if p50 not in (None, 0) and p99 is not None else None,
+        "minor_faults": core.get("minor_faults"),
+        "major_faults": core.get("major_faults"),
+        "voluntary_cs": core.get("voluntary_cs"),
+        "involuntary_cs": core.get("involuntary_cs"),
+        "rusage_available": core.get("rusage_available"),
+    }
+
+
+def _number(value, digits=3, suffix=""):
+    if value is None:
+        return "n/a"
+    return ("%%.%df%%s" % digits) % (value, suffix)
+
+
+def _run_rows(views):
+    rows = []
+    for run in views:
+        label = html.escape(run["label"])
+        if run["link"]:
+            label = "<a href='%s'>%s</a>" % (html.escape(run["link"], quote=True), label)
+        scheduler = "%s · nice %s · RT %s · CPU %s" % (
+            run["policy"], run["nice"] if run["nice"] is not None else "n/a",
+            run["priority"] if run["priority"] is not None else "n/a",
+            ",".join(map(str, run["affinity"])) or "n/a")
+        if run["status"] == "ok" and run["samples"]:
+            misses = "n/a" if run["deadline_misses"] is None else "%d · %.1f%%" % (
+                run["deadline_misses"], run["miss_percent"])
+            values = (
+                str(run["samples"]), _number(run["wall_p50_ms"]), _number(run["wall_p99_ms"]),
+                _number(run["wall_max_ms"]), _number(run["response_p99_ms"]),
+                _number(run["wake_p99_ms"]), misses, _number(run["throughput"], 1),
+                html.escape(scheduler))
+        elif run["status"] == "ok":
+            values = ("0", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "0.0",
+                      "No jobs started in the measurement window")
+        else:
+            values = ("—", "—", "—", "—", "—", "—", "—", "—",
+                      html.escape(run["reason"] or "No reason recorded"))
+        rows.append(
+            "<tr data-run-index='%d'><td>%s</td><td><span class='status status-%s'>%s</span></td>"
+            "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+            "<td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                run["index"], label, html.escape(run["status"]), html.escape(run["status"]), *values))
+    return "".join(rows)
+
+
+def _repeat_rows(views):
+    groups = {}
+    for run in views:
+        if run["status"] == "ok" and run["wall_p99_ms"] is not None:
+            groups.setdefault(run["case"], []).append(run)
+    rows = []
+    for case, runs in sorted(groups.items()):
+        p99s = [run["wall_p99_ms"] for run in runs]
+        maxima = [run["wall_max_ms"] for run in runs]
+        rows.append("<tr><td>%s</td><td>%d</td><td>%.3f</td><td>%.3f–%.3f</td><td>%.3f</td></tr>" % (
+            html.escape(case), len(runs), statistics.median(p99s), min(p99s), max(p99s), max(maxima)))
+    return "".join(rows) or "<tr><td colspan='5'>No successful repetitions to summarize.</td></tr>"
+
+
+def _summary(views):
+    successful = [run for run in views if run["status"] == "ok"]
+    measured = [run for run in successful if run["wall_p99_ms"] is not None]
+    periodic = [run for run in successful if run["deadline_misses"] is not None]
+    total_misses = sum(run["deadline_misses"] for run in periodic)
+    periodic_samples = sum(run["samples"] for run in periodic)
+    return {
+        "RUNS": str(len(views)),
+        "SUCCESSFUL": str(len(successful)),
+        "P99": _number(statistics.median(run["wall_p99_ms"] for run in measured), 3, " ms")
+               if measured else "n/a",
+        "MISSES": "%d / %d" % (total_misses, periodic_samples) if periodic else "n/a",
+    }
+
+
+def _script_json(value):
+    return (json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+            .replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+def _render(template, values):
+    pattern = re.compile(r"@@([A-Z0-9_]+)@@")
+    return pattern.sub(lambda match: values[match.group(1)], template)
 
 
 def write_report(manifest, path):
-    rows = []
-    successful = [run for run in manifest["runs"] if run["status"] == "ok" and run["metrics"]["samples"]]
-    maximum = max((r["metrics"]["wall_processing_ns"]["max"] for r in successful), default=1) or 1
-    charts = []
-    for run in manifest["runs"]:
-        label = html.escape(run["label"])
-        status = html.escape(run["status"])
-        if status != "ok":
-            rows.append("<tr><td>%s</td><td>%s</td><td colspan='7'>%s</td></tr>" %
-                        (label, status, html.escape(run.get("reason", ""))))
-            continue
-        m = run["metrics"]
-        core = run["core"]
-        if not m["samples"]:
-            rows.append("<tr><td>%s</td><td>ok</td><td>0</td><td colspan='6'>"
-                        "No job started within the measurement window; throughput 0 jobs/s. "
-                        "This may be starvation, not a missing result.</td></tr>" % label)
-            continue
-        misses = m["deadline_misses"]
-        effective = core["effective"]
-        description = "%s / nice %d / RT %d / CPUs %s" % (
-            effective["policy"], effective["nice"], effective["priority"], effective["affinity"])
-        link = html.escape(run.get("artifact_prefix", ""), quote=True) + ".csv"
-        rows.append(
-            "<tr><td><a href='%s'>%s</a></td><td>%s</td><td>%d</td>"
-            "<td>%.3f / %.3f / %.3f</td><td>%.3f</td><td>%.3f</td><td>%s</td>"
-            "<td>%.1f</td><td>%s</td></tr>" %
-            (link, label, status, m["samples"], m["wall_processing_ns"]["p50"] / 1e6,
-             m["wall_processing_ns"]["p99"] / 1e6, m["wall_processing_ns"]["max"] / 1e6,
-             m["response_ns"]["p99"] / 1e6, m["wake_lateness_ns"]["p99"] / 1e6,
-             "n/a" if misses is None else "%d (%.1f%%)" % (misses, 100*m["miss_fraction"]),
-             m["throughput_jobs_s"], html.escape(description)))
-        # All bars use a shared scale, preserving honest comparisons between runs.
-        bars = []
-        for index, (key, color) in enumerate((("max", "#8796a5"), ("p99", "#e7a330"), ("p50", "#2879b8"))):
-            width = 560 * m["wall_processing_ns"][key] / maximum
-            bars.append("<rect x='0' y='%d' width='%.2f' height='9' fill='%s'/>" %
-                        (index*11, width, color))
-        charts.append("<div class='chart'><b>%s</b><svg viewBox='0 0 560 34' role='img' "
-                      "aria-label='Wall processing maximum, p99 and median'>%s</svg></div>" %
-                      (label, "".join(bars)))
-    groups = {}
-    for run in successful:
-        groups.setdefault(run["case"], []).append(run)
-    repeat_rows = []
-    for case, runs in groups.items():
-        repeat_rows.append("<tr><td>%s</td><td>%d</td><td>%.3f</td><td>%.3f</td></tr>" % (
-            html.escape(case), len(runs),
-            statistics.median(r["metrics"]["wall_processing_ns"]["p99"] for r in runs)/1e6,
-            max(r["metrics"]["wall_processing_ns"]["max"] for r in runs)/1e6))
+    views = [_view(run, index) for index, run in enumerate(manifest.get("runs", []))]
     environment = manifest.get("environment", {})
-    summary = environment.get("system", {})
-    page = """<!doctype html>
-<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Linux scheduling lab report</title>
-<style>
-body{font:16px/1.5 system-ui,sans-serif;max-width:1250px;margin:2em auto;padding:0 1em;color:#202b36;background:#fbfcfd}
-h1,h2{line-height:1.2}table{border-collapse:collapse;width:100%%;font-size:.86em}
-th,td{text-align:left;padding:.6em;border-bottom:1px solid #ccd3da;vertical-align:top}
-th{background:#e8eef3}.scroll{overflow:auto}pre{white-space:pre-wrap;overflow-wrap:anywhere}
-.note{border-left:4px solid #e7a330;padding:1em;background:#fff7e7}
-.chart{display:grid;grid-template-columns: minmax(180px,1fr) 2fr;gap:1em;margin:.6em 0;font-size:.85em}
-svg{width:100%%;max-height:40px}a{color:#145c94}
-</style>
-<h1>Linux scheduling lab</h1>
-<p>%(title)s</p><p>%(system)s</p>
-<p class="note">These are observed samples, not worst-case execution-time guarantees.
-Synthetic audio misses are not hardware XRUNs. Short runs and hosted CI do not prove hard RT.
-Offline response/lateness is cumulative from the shared release, not a periodic deadline.
-Results include instrumentation overhead and real host interference.</p>
-<h2>Individual runs</h2><div class="scroll"><table>
-<tr><th>Run / raw CSV</th><th>Status</th><th>Samples</th><th>Wall ms p50 / p99 / max</th>
-<th>Response p99 ms</th><th>Wake p99 ms</th><th>Misses</th><th>Jobs/s</th><th>Effective scheduler</th></tr>
-%(rows)s</table></div>
-<h2>Wall-processing distributions</h2>
-<p>Common scale; gray = observed maximum, amber = p99, blue = median. Raw timestamps are in nanoseconds.</p>
-%(charts)s
-<h2>Repetitions (not pooled samples)</h2><table>
-<tr><th>Case</th><th>Runs</th><th>Median of per-run p99 (ms)</th><th>Largest observation (ms)</th></tr>
-%(repeats)s</table>
-<h2>Provenance and parameters</h2><p>The run.json alongside this report is the machine-readable source.
-Inspect source environment, skips, commands, cgroup counters and raw artifacts before drawing conclusions.</p>
-<details><summary>Full manifest</summary><pre>%(manifest)s</pre></details>
-</html>""" % {
-        "title": html.escape(manifest.get("title", manifest.get("preset", "comparison")) +
-                             " | status: " + manifest.get("status", "comparison")),
-        "system": html.escape(json.dumps(summary, sort_keys=True)),
-        "rows": "".join(rows), "charts": "".join(charts), "repeats": "".join(repeat_rows),
-        "manifest": html.escape(json.dumps(manifest, indent=2, sort_keys=True)),
+    system = environment.get("system", {})
+    title = str(manifest.get("title", manifest.get("preset", "Scheduling comparison")))
+    summary = _summary(views)
+    status = str(manifest.get("status", "comparison"))
+    values = {
+        "TITLE": html.escape(title),
+        "PAGE_TITLE": html.escape(title + " · Linux scheduling lab"),
+        "STATUS": html.escape(status),
+        "STATUS_CLASS": html.escape(status if status in ("ok", "skipped", "error", "interrupted") else "comparison"),
+        "SYSTEM": html.escape("%s · Linux %s · %s" % (
+            system.get("architecture", "unknown architecture"), system.get("kernel", "unknown kernel"),
+            system.get("hostname", "unknown host"))),
+        "ROWS": _run_rows(views),
+        "REPEATS": _repeat_rows(views),
+        "MANIFEST": html.escape(json.dumps(manifest, indent=2, sort_keys=True)),
+        "REPORT_DATA": _script_json({"title": title, "status": status, "runs": views}),
+        **summary,
     }
-    Path(path).write_text(page)
+    Path(path).write_text(_render(TEMPLATE.read_text(), values))
 
 
 def compare(paths, output):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     combined = {"schema_version": 1, "preset": "comparison", "runs": [], "sources": [],
-                "title": "Cross-run comparison: check equivalent parameters, binary and hardware before attribution."}
+                "title": "Cross-run comparison: verify equivalent parameters, binaries and hardware before attribution."}
     for index, path in enumerate(paths):
         source = Path(path)
         if source.is_dir():
@@ -118,7 +193,7 @@ def compare(paths, output):
             run["label"] = "%d: %s" % (index+1, run["label"])
             run["case"] = "%d: %s" % (index+1, run["case"])
             if "artifact_prefix" in run:
-                # Absolute file URI also works when the report is opened from a different directory.
+                # Absolute file URI also works when the report moves to a comparison directory.
                 run["artifact_prefix"] = (source.parent / run["artifact_prefix"]).resolve().as_uri()
             combined["runs"].append(run)
     (output / "run.json").write_text(json.dumps(combined, indent=2) + "\n")

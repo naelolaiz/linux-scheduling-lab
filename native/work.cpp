@@ -8,8 +8,10 @@
 #include <chrono>
 #include <memory>
 #include <new>
+#include <optional>
 #include <semaphore>
 #include <span>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -43,14 +45,36 @@ constexpr int PIXELS = WIDTH * HEIGHT;
 constexpr int MAX_SAMPLES = 20000;
 constexpr size_t MEMORY_BYTES = 16U * 1024U * 1024U;
 
-struct options {
-    const char *mode, *policy, *output, *memory, *protocol;
-    int jobs, work, cpu, nice_value, priority, allow_rt, warmup;
-    int period_us, runtime_us, deadline_us, duration_ms, timeout_ms;
-    uint64_t start_ns;
+enum class WorkloadMode { offline, audio, video, lock };
+enum class SchedulingPolicy { other, batch, idle, fifo, rr, deadline };
+enum class MemoryStrategy { demand, prefault, locked };
+enum class LockProtocol { none, inherit };
+
+struct Options {
+    WorkloadMode mode = WorkloadMode::offline;
+    SchedulingPolicy policy = SchedulingPolicy::other;
+    std::string_view output;
+    MemoryStrategy memory = MemoryStrategy::prefault;
+    LockProtocol protocol = LockProtocol::none;
+    int jobs = 40;
+    int work = 4;
+    int cpu = -1;
+    int nice_value = 0;
+    int priority = 10;
+    bool allow_rt = false;
+    int warmup = 2;
+    int period_us = 10000;
+    int runtime_us = 1000;
+    int deadline_us = 10000;
+    int duration_ms = 0;
+    int timeout_ms = 8000;
+    std::uint64_t start_ns = 0;
 };
-struct sample {
-    uint64_t release, start, finish, cpu;
+struct Sample {
+    std::uint64_t release = 0;
+    std::uint64_t start = 0;
+    std::uint64_t finish = 0;
+    std::uint64_t cpu = 0;
 };
 /* Linux's version-0 sched_setattr ABI, independent of libc header version. */
 struct lab_sched_attr {
@@ -81,17 +105,18 @@ struct buffers {
     std::span<uint8_t> image, scratch;
     std::vector<int16_t> audio;
     Mapping pages;
-    std::vector<sample> samples;
+    std::vector<Sample> samples;
     size_t frames = 0, page_size = 0;
     std::array<double,128> filter{};
     uint64_t checksum = 0;
 };
-struct effective {
-    int policy, nice_value;
-    struct sched_param param;
-    cpu_set_t cpus;
-    struct lab_sched_attr attr;
-    uint64_t rr_quantum_ns;
+struct Effective {
+    int policy = SCHED_OTHER;
+    int nice_value = 0;
+    sched_param param{};
+    cpu_set_t cpus{};
+    lab_sched_attr attr{};
+    std::uint64_t rr_quantum_ns = 0;
 };
 static volatile sig_atomic_t interrupted;
 static void handle_signal(int sig) { interrupted = sig; }
@@ -108,59 +133,135 @@ static int set(int policy, const sched_param &param) {
 }
 }
 
-static uint64_t clock_ns(clockid_t clock_id) {
-    struct timespec ts;
-    if (clock_gettime(clock_id, &ts)) { perror("clock_gettime"); exit(1); }
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+struct ClockReading {
+    std::uint64_t nanoseconds = 0;
+    int error = 0;
+    explicit operator bool() const noexcept { return error == 0; }
+};
+
+static ClockReading read_clock(clockid_t clock_id) noexcept {
+    timespec timestamp{};
+    if (clock_gettime(clock_id,&timestamp)) return {.error = errno};
+    return {.nanoseconds = static_cast<std::uint64_t>(timestamp.tv_sec)*1000000000ULL+
+                           static_cast<std::uint64_t>(timestamp.tv_nsec)};
 }
-static int sleep_until(uint64_t ns) {
-    struct timespec ts = {(time_t)(ns / 1000000000ULL), (long)(ns % 1000000000ULL)};
+static int sleep_until(std::uint64_t ns) {
+    const timespec ts = {static_cast<time_t>(ns/1000000000ULL),
+                         static_cast<long>(ns%1000000000ULL)};
     int rc;
-    do { rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL); }
+    do { rc = clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,nullptr); }
     while (rc == EINTR && !interrupted);
     return rc;
 }
-static void json_string(FILE *f, const char *s) {
-    fputc('"', f);
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\') { fputc('\\', f); fputc(c, f); }
-        else if (c < 32) fprintf(f, "\\u%04x", c);
-        else fputc(c, f);
+static void json_string(FILE &file, std::string_view text) {
+    fputc('"',&file);
+    for (const unsigned char c : text) {
+        if (c == '"' || c == '\\') { fputc('\\',&file); fputc(c,&file); }
+        else if (c < 32) fprintf(&file,"\\u%04x",c);
+        else fputc(c,&file);
     }
-    fputc('"', f);
+    fputc('"',&file);
 }
-static int status(const char *state, const char *reason, int code) {
+static int status(std::string_view state, std::string_view reason, int code) {
     printf("{\"schema_version\":1,\"status\":");
-    json_string(stdout, state);
+    json_string(*stdout,state);
     printf(",\"reason\":");
-    json_string(stdout, reason);
+    json_string(*stdout,reason);
     puts("}");
     return code;
 }
-static int failure(const char *action, int err, int optional) {
-    char msg[256];
-    snprintf(msg, sizeof(msg), "%s: %s (%d)", action, strerror(err), err);
-    return status(optional ? "skipped" : "error", msg, optional ? 77 : 1);
+static int failure(std::string_view action, int error, bool optional) {
+    printf("{\"schema_version\":1,\"status\":\"%s\",\"reason\":\"",
+           optional ? "skipped" : "error");
+    for (const auto part : {action,std::string_view(": "),std::string_view(strerror(error))}) {
+        for (const unsigned char c : part) {
+            if (c == '"' || c == '\\') { fputc('\\',stdout); fputc(c,stdout); }
+            else if (c < 32) fprintf(stdout,"\\u%04x",c);
+            else fputc(c,stdout);
+        }
+    }
+    printf(" (%d)\"}\n",error);
+    return optional ? 77 : 1;
 }
-static int number(const char *s, long min, long max, const char *name) {
+static std::optional<int> number(std::string_view input, long min, long max,
+                                 std::string_view name) {
     long n = 0;
-    std::string_view input(s);
     auto [end, error] = std::from_chars(input.data(),input.data()+input.size(),n);
     if (error != std::errc{} || end != input.data()+input.size() || n < min || n > max) {
-        fprintf(stderr, "%s must be in [%ld, %ld]\n", name, min, max);
-        exit(2);
+        fprintf(stderr,"%.*s must be in [%ld, %ld]\n",static_cast<int>(name.size()),
+                name.data(),min,max);
+        return std::nullopt;
     }
-    return (int)n;
+    return static_cast<int>(n);
 }
-static int policy_id(const char *s) {
-    if (!strcmp(s, "other")) return SCHED_OTHER;
-    if (!strcmp(s, "batch")) return SCHED_BATCH;
-    if (!strcmp(s, "idle")) return SCHED_IDLE;
-    if (!strcmp(s, "fifo")) return SCHED_FIFO;
-    if (!strcmp(s, "rr")) return SCHED_RR;
-    if (!strcmp(s, "deadline")) return SCHED_DEADLINE;
+static std::optional<WorkloadMode> parse_mode(std::string_view value) {
+    if (value == "offline") return WorkloadMode::offline;
+    if (value == "audio") return WorkloadMode::audio;
+    if (value == "video") return WorkloadMode::video;
+    if (value == "lock") return WorkloadMode::lock;
+    return std::nullopt;
+}
+static std::optional<SchedulingPolicy> parse_policy(std::string_view value) {
+    if (value == "other") return SchedulingPolicy::other;
+    if (value == "batch") return SchedulingPolicy::batch;
+    if (value == "idle") return SchedulingPolicy::idle;
+    if (value == "fifo") return SchedulingPolicy::fifo;
+    if (value == "rr") return SchedulingPolicy::rr;
+    if (value == "deadline") return SchedulingPolicy::deadline;
+    return std::nullopt;
+}
+static std::optional<MemoryStrategy> parse_memory(std::string_view value) {
+    if (value == "demand") return MemoryStrategy::demand;
+    if (value == "prefault") return MemoryStrategy::prefault;
+    if (value == "mlock") return MemoryStrategy::locked;
+    return std::nullopt;
+}
+static std::optional<LockProtocol> parse_protocol(std::string_view value) {
+    if (value == "none") return LockProtocol::none;
+    if (value == "inherit") return LockProtocol::inherit;
+    return std::nullopt;
+}
+static int policy_id(SchedulingPolicy policy) {
+    switch (policy) {
+        case SchedulingPolicy::other: return SCHED_OTHER;
+        case SchedulingPolicy::batch: return SCHED_BATCH;
+        case SchedulingPolicy::idle: return SCHED_IDLE;
+        case SchedulingPolicy::fifo: return SCHED_FIFO;
+        case SchedulingPolicy::rr: return SCHED_RR;
+        case SchedulingPolicy::deadline: return SCHED_DEADLINE;
+    }
     return -1;
+}
+static const char *mode_name(WorkloadMode mode) {
+    switch (mode) {
+        case WorkloadMode::offline: return "offline";
+        case WorkloadMode::audio: return "audio";
+        case WorkloadMode::video: return "video";
+        case WorkloadMode::lock: return "lock";
+    }
+    return "unknown";
+}
+static const char *policy_name(SchedulingPolicy policy) {
+    switch (policy) {
+        case SchedulingPolicy::other: return "other";
+        case SchedulingPolicy::batch: return "batch";
+        case SchedulingPolicy::idle: return "idle";
+        case SchedulingPolicy::fifo: return "fifo";
+        case SchedulingPolicy::rr: return "rr";
+        case SchedulingPolicy::deadline: return "deadline";
+    }
+    return "unknown";
+}
+static const char *memory_name(MemoryStrategy memory) {
+    switch (memory) {
+        case MemoryStrategy::demand: return "demand";
+        case MemoryStrategy::prefault: return "prefault";
+        case MemoryStrategy::locked: return "mlock";
+    }
+    return "unknown";
+}
+static const char *protocol_name(LockProtocol protocol) {
+    return protocol == LockProtocol::inherit ? "inherit" : "none";
 }
 static const char *policy_name(int p) {
     switch (p) {
@@ -184,9 +285,14 @@ static void usage(void) {
          "Default: 40 jobs, 4 filter passes, 10ms audio / 30ms video period.\n"
          "Exit codes: 0 ok, 77 unavailable/permission/safety skip, 2 invalid, 1 failure.");
 }
-static struct options parse(int argc, char **argv) {
-    struct options o = {"offline", "other", NULL, "prefault", "none",
-                        40, 4, -1, 0, 10, 0, 2, 10000, 1000, 10000, 0, 8000, 0};
+enum class ParseStatus { run, help, invalid };
+struct ParseResult {
+    Options options;
+    ParseStatus status = ParseStatus::invalid;
+};
+
+static ParseResult parse(int argc, char **argv) {
+    Options options;
     enum { MODE = 1000, POLICY, OUTPUT, MEMORY, PROTOCOL, JOBS, WORK, CPU,
            NICE, PRIORITY, ALLOW_RT, WARMUP, PERIOD, RUNTIME, DEADLINE,
            DURATION, TIMEOUT, START };
@@ -200,417 +306,646 @@ static struct options parse(int argc, char **argv) {
         {"duration-ms",1,0,DURATION}, {"timeout-ms",1,0,TIMEOUT},
         {"start-ns",1,0,START}, {"help",0,0,'h'}, {0,0,0,0}
     };
-    int c, period_set = 0;
-    while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
-        switch (c) {
-            case MODE: o.mode = optarg; break;
-            case POLICY: o.policy = optarg; break;
-            case OUTPUT: o.output = optarg; break;
-            case MEMORY: o.memory = optarg; break;
-            case PROTOCOL: o.protocol = optarg; break;
-            case JOBS: o.jobs = number(optarg,1,MAX_SAMPLES,"jobs"); break;
-            case WORK: o.work = number(optarg,1,128,"work"); break;
-            case CPU: o.cpu = number(optarg,0,CPU_SETSIZE-1,"cpu"); break;
-            case NICE: o.nice_value = number(optarg,-20,19,"nice"); break;
-            case PRIORITY: o.priority = number(optarg,1,20,"priority"); break;
-            case ALLOW_RT: o.allow_rt = 1; break;
-            case WARMUP: o.warmup = number(optarg,0,100,"warmup"); break;
-            case PERIOD: o.period_us = number(optarg,1000,100000,"period-us"); period_set = 1; break;
-            case RUNTIME: o.runtime_us = number(optarg,100,100000,"runtime-us"); break;
-            case DEADLINE: o.deadline_us = number(optarg,1000,100000,"deadline-us"); break;
-            case DURATION: o.duration_ms = number(optarg,0,10000,"duration-ms"); break;
-            case TIMEOUT: o.timeout_ms = number(optarg,100,15000,"timeout-ms"); break;
+    bool output_set = false;
+    bool period_set = false;
+    int option;
+    while ((option = getopt_long(argc,argv,"h",opts,nullptr)) != -1) {
+        std::optional<int> parsed_number;
+        switch (option) {
+            case MODE: {
+                const auto value = parse_mode(optarg);
+                if (!value) { fputs("invalid mode\n",stderr); return {options,ParseStatus::invalid}; }
+                options.mode = *value;
+                break;
+            }
+            case POLICY: {
+                const auto value = parse_policy(optarg);
+                if (!value) { fputs("invalid policy\n",stderr); return {options,ParseStatus::invalid}; }
+                options.policy = *value;
+                break;
+            }
+            case OUTPUT: options.output = optarg; output_set = true; break;
+            case MEMORY: {
+                const auto value = parse_memory(optarg);
+                if (!value) { fputs("invalid memory strategy\n",stderr); return {options,ParseStatus::invalid}; }
+                options.memory = *value;
+                break;
+            }
+            case PROTOCOL: {
+                const auto value = parse_protocol(optarg);
+                if (!value) { fputs("invalid mutex protocol\n",stderr); return {options,ParseStatus::invalid}; }
+                options.protocol = *value;
+                break;
+            }
+            case JOBS:
+                parsed_number = number(optarg,1,MAX_SAMPLES,"jobs");
+                if (parsed_number) options.jobs = *parsed_number;
+                break;
+            case WORK:
+                parsed_number = number(optarg,1,128,"work");
+                if (parsed_number) options.work = *parsed_number;
+                break;
+            case CPU:
+                parsed_number = number(optarg,0,CPU_SETSIZE-1,"cpu");
+                if (parsed_number) options.cpu = *parsed_number;
+                break;
+            case NICE:
+                parsed_number = number(optarg,-20,19,"nice");
+                if (parsed_number) options.nice_value = *parsed_number;
+                break;
+            case PRIORITY:
+                parsed_number = number(optarg,1,20,"priority");
+                if (parsed_number) options.priority = *parsed_number;
+                break;
+            case ALLOW_RT: options.allow_rt = true; break;
+            case WARMUP:
+                parsed_number = number(optarg,0,100,"warmup");
+                if (parsed_number) options.warmup = *parsed_number;
+                break;
+            case PERIOD:
+                parsed_number = number(optarg,1000,100000,"period-us");
+                if (parsed_number) { options.period_us = *parsed_number; period_set = true; }
+                break;
+            case RUNTIME:
+                parsed_number = number(optarg,100,100000,"runtime-us");
+                if (parsed_number) options.runtime_us = *parsed_number;
+                break;
+            case DEADLINE:
+                parsed_number = number(optarg,1000,100000,"deadline-us");
+                if (parsed_number) options.deadline_us = *parsed_number;
+                break;
+            case DURATION:
+                parsed_number = number(optarg,0,10000,"duration-ms");
+                if (parsed_number) options.duration_ms = *parsed_number;
+                break;
+            case TIMEOUT:
+                parsed_number = number(optarg,100,15000,"timeout-ms");
+                if (parsed_number) options.timeout_ms = *parsed_number;
+                break;
             case START: {
                 std::string_view input(optarg);
-                auto [end, error] = std::from_chars(input.data(),input.data()+input.size(),o.start_ns);
+                auto [end, error] = std::from_chars(input.data(),input.data()+input.size(),options.start_ns);
                 if (error != std::errc{} || end != input.data()+input.size()) {
-                    fprintf(stderr,"start-ns must be an unsigned integer\n"); exit(2);
+                    fputs("start-ns must be an unsigned integer\n",stderr);
+                    return {options,ParseStatus::invalid};
                 }
                 break;
             }
-            case 'h': usage(); exit(0);
-            default: exit(2);
+            case 'h': return {options,ParseStatus::help};
+            default: return {options,ParseStatus::invalid};
         }
+        if (!parsed_number.has_value() && option >= JOBS && option <= TIMEOUT &&
+            option != ALLOW_RT && option != START) return {options,ParseStatus::invalid};
     }
-    if (!period_set && !strcmp(o.mode,"video")) o.period_us = 30000;
-    if (optind != argc || !o.output || policy_id(o.policy) < 0 ||
-        (strcmp(o.mode,"offline") && strcmp(o.mode,"audio") &&
-         strcmp(o.mode,"video") && strcmp(o.mode,"lock")) ||
-        (strcmp(o.memory,"demand") && strcmp(o.memory,"prefault") && strcmp(o.memory,"mlock")) ||
-        (strcmp(o.protocol,"none") && strcmp(o.protocol,"inherit"))) {
-        fprintf(stderr,"Invalid mode, policy, memory, protocol or missing --output\n"); exit(2);
+    if (!period_set && options.mode == WorkloadMode::video) options.period_us = 30000;
+    if (optind != argc || !output_set) {
+        fputs("unexpected argument or missing --output\n",stderr);
+        return {options,ParseStatus::invalid};
     }
-    if (o.duration_ms && strcmp(o.mode,"offline")) {
-        fprintf(stderr,"--duration-ms is only valid for offline mode\n"); exit(2);
+    if (options.duration_ms && options.mode != WorkloadMode::offline) {
+        fputs("--duration-ms is only valid for offline mode\n",stderr);
+        return {options,ParseStatus::invalid};
     }
-    if (!strcmp(o.policy,"deadline") &&
-        (o.runtime_us > o.deadline_us || o.deadline_us > o.period_us ||
-         o.runtime_us * 5 > o.period_us || o.cpu >= 0 ||
-         !strcmp(o.mode,"offline") || !strcmp(o.mode,"lock"))) {
-        fprintf(stderr,"DEADLINE requires periodic mode, no --cpu, runtime <= deadline <= period, utilization <= 20%%\n");
-        exit(2);
+    if (options.policy == SchedulingPolicy::deadline &&
+        (options.runtime_us > options.deadline_us || options.deadline_us > options.period_us ||
+         options.runtime_us*5 > options.period_us || options.cpu >= 0 ||
+         options.mode == WorkloadMode::offline || options.mode == WorkloadMode::lock)) {
+        fputs("DEADLINE requires periodic mode, no --cpu, runtime <= deadline <= period, utilization <= 20%\n",stderr);
+        return {options,ParseStatus::invalid};
     }
-    if (!strcmp(o.mode,"lock") && strcmp(o.policy,"fifo")) {
-        fprintf(stderr,"lock mode requires --policy fifo\n"); exit(2);
+    if (options.mode == WorkloadMode::lock && options.policy != SchedulingPolicy::fifo) {
+        fputs("lock mode requires --policy fifo\n",stderr);
+        return {options,ParseStatus::invalid};
     }
-    if (!strcmp(o.mode,"lock") && o.priority > 18) {
-        fprintf(stderr,"lock base priority must be <= 18 (high thread is base + 2)\n"); exit(2);
+    if (options.mode == WorkloadMode::lock && options.priority > 18) {
+        fputs("lock base priority must be <= 18 (high thread is base + 2)\n",stderr);
+        return {options,ParseStatus::invalid};
     }
-    if (!strcmp(o.mode,"audio") && (uint64_t)o.jobs*o.period_us*48000/1000000 > 10000000) {
-        fprintf(stderr,"audio output is limited to 10 million samples; reduce jobs/period\n"); exit(2);
+    if (options.mode == WorkloadMode::audio &&
+        static_cast<std::uint64_t>(options.jobs)*options.period_us*48000/1000000 > 10000000) {
+        fputs("audio output is limited to 10 million samples; reduce jobs/period\n",stderr);
+        return {options,ParseStatus::invalid};
     }
-    return o;
+    return {options,ParseStatus::run};
 }
-static int set_policy(const struct options *o) {
-    int p = policy_id(o->policy);
-    if (setpriority(PRIO_PROCESS,0,o->nice_value)) return -1;
-    if (p == SCHED_DEADLINE) {
+static int set_policy(const Options &options) {
+    const int policy = policy_id(options.policy);
+    if (setpriority(PRIO_PROCESS,0,options.nice_value)) return -1;
+    if (policy == SCHED_DEADLINE) {
 #ifdef SYS_sched_setattr
-        struct lab_sched_attr a;
-        memset(&a,0,sizeof(a));
-        a.size = sizeof(a); a.policy = SCHED_DEADLINE;
-        a.runtime = (uint64_t)o->runtime_us * 1000;
-        a.deadline = (uint64_t)o->deadline_us * 1000;
-        a.period = (uint64_t)o->period_us * 1000;
-        return (int)syscall(SYS_sched_setattr,0,&a,0);
+        lab_sched_attr attributes{};
+        attributes.size = sizeof(attributes);
+        attributes.policy = SCHED_DEADLINE;
+        attributes.runtime = static_cast<std::uint64_t>(options.runtime_us)*1000;
+        attributes.deadline = static_cast<std::uint64_t>(options.deadline_us)*1000;
+        attributes.period = static_cast<std::uint64_t>(options.period_us)*1000;
+        return static_cast<int>(syscall(SYS_sched_setattr,0,&attributes,0));
 #else
         errno = ENOSYS; return -1;
 #endif
     }
-    struct sched_param sp{};
-    if (p == SCHED_FIFO || p == SCHED_RR) sp.sched_priority = o->priority;
-    return thread_scheduler::set(p,sp);
+    sched_param parameters{};
+    if (policy == SCHED_FIFO || policy == SCHED_RR) parameters.sched_priority = options.priority;
+    return thread_scheduler::set(policy,parameters);
 }
 static int optional_errno(int e) {
     return e == EPERM || e == EACCES || e == ENOSYS || e == EBUSY ||
            e == EINVAL || e == ENOTSUP;
 }
-static int allocate(struct buffers *b, const struct options *o) {
-    b->frames = (size_t)o->period_us * 48000 / 1000000;
-    b->page_size = (size_t)sysconf(_SC_PAGESIZE);
-    size_t audio_samples = !strcmp(o->mode,"audio") ? (size_t)o->jobs*b->frames : 1;
+static int allocate(buffers &storage, const Options &options) {
+    storage.frames = static_cast<std::size_t>(options.period_us)*48000/1000000;
+    errno = 0;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+        return failure("read page size",errno ? errno : EINVAL,false);
+    storage.page_size = static_cast<std::size_t>(page_size);
+    const std::size_t audio_samples = options.mode == WorkloadMode::audio ?
+        static_cast<std::size_t>(options.jobs)*storage.frames : 1;
     try {
-        b->samples.resize(MAX_SAMPLES);
-        for (auto &plane : b->planes) plane.resize(PIXELS);
-        b->audio.resize(audio_samples);
+        storage.samples.resize(MAX_SAMPLES);
+        for (auto &plane : storage.planes) plane.resize(PIXELS);
+        storage.audio.resize(audio_samples);
     } catch (const std::bad_alloc &) {
-        return failure("preallocate buffers",ENOMEM,0);
+        return failure("preallocate buffers",ENOMEM,false);
     }
-    b->image = b->planes[0]; b->scratch = b->planes[1];
-    if (!b->pages.allocate()) return failure("map page probe",errno,0);
+    storage.image = storage.planes[0];
+    storage.scratch = storage.planes[1];
+    if (!storage.pages.allocate()) return failure("map page probe",errno,false);
     /* Commit output buffers before changing policy; the separate page probe is intentional. */
-    std::ranges::fill(b->samples,sample{1,1,1,1});
-    std::ranges::fill(b->audio,1);
-    if (strcmp(o->memory,"demand"))
-        for (size_t n = 0; n < MEMORY_BYTES; n += b->page_size) b->pages[n] = 1;
-    if (!strcmp(o->memory,"mlock") && mlock(b->pages.data(),MEMORY_BYTES))
+    std::ranges::fill(storage.samples,Sample{1,1,1,1});
+    std::ranges::fill(storage.audio,1);
+    if (options.memory != MemoryStrategy::demand)
+        for (std::size_t n = 0; n < MEMORY_BYTES; n += storage.page_size) storage.pages[n] = 1;
+    if (options.memory == MemoryStrategy::locked && mlock(storage.pages.data(),MEMORY_BYTES))
         return failure("mlock page probe",errno,errno == EPERM || errno == ENOMEM || errno == EAGAIN);
     return 0;
 }
-static void video_work(struct buffers *b, int job, int work) {
+static void video_work(buffers &storage, int job, int work) {
     for (int y = 0; y < HEIGHT; y++)
         for (int x = 0; x < WIDTH; x++)
-            b->image[y*WIDTH+x] = (uint8_t)((x*3+y*5+job*7) & 255);
+            storage.image[y*WIDTH+x] = static_cast<std::uint8_t>((x*3+y*5+job*7)&255);
     // Both ping-pong buffers must retain this frame's border, not the previous frame's.
-    std::ranges::copy(b->image,b->scratch.begin());
+    std::ranges::copy(storage.image,storage.scratch.begin());
     for (int p = 0; p < work; p++) {
         for (int y = 1; y < HEIGHT-1; y++) {
             for (int x = 1; x < WIDTH-1; x++) {
                 unsigned sum = 0;
                 for (int dy = -1; dy <= 1; dy++)
                     for (int dx = -1; dx <= 1; dx++)
-                        sum += b->image[(y+dy)*WIDTH+x+dx];
-                b->scratch[y*WIDTH+x] = (uint8_t)(sum/9);
+                        sum += storage.image[(y+dy)*WIDTH+x+dx];
+                storage.scratch[y*WIDTH+x] = static_cast<std::uint8_t>(sum/9);
             }
         }
-        std::swap(b->image,b->scratch);
+        std::swap(storage.image,storage.scratch);
     }
-    b->checksum += b->image[(job*31U) % PIXELS];
+    storage.checksum += storage.image[(job*31U)%PIXELS];
 }
-static void audio_work(struct buffers *b, int job, int work, int save) {
-    for (size_t n = 0; n < b->frames; n++) {
+static void audio_work(buffers &storage, int job, int work, bool save) {
+    for (std::size_t n = 0; n < storage.frames; n++) {
         double x = 0.6 * sin(6.283185307179586 * 440.0 *
-                             ((double)job*b->frames+n) / 48000.0);
+                             (static_cast<double>(job)*storage.frames+n)/48000.0);
         for (int p = 0; p < work; p++) {
-            b->filter[p] += 0.2 * (x-b->filter[p]);
-            x = b->filter[p];
+            storage.filter[p] += 0.2*(x-storage.filter[p]);
+            x = storage.filter[p];
         }
-        int16_t v = (int16_t)(x*30000);
-        if (save) b->audio[(size_t)job*b->frames+n] = v;
-        b->checksum += (uint16_t)v;
+        const auto value = static_cast<std::int16_t>(x*30000);
+        if (save) storage.audio[static_cast<std::size_t>(job)*storage.frames+n] = value;
+        storage.checksum += static_cast<std::uint16_t>(value);
     }
 }
-static void probe_pages(struct buffers *b, int job) {
-    for (size_t p = 0; p < 128; p++) {
-        size_t off = (((size_t)job*128+p)*b->page_size) % MEMORY_BYTES;
-        b->pages[off] = (unsigned char)job;
+static void probe_pages(buffers &storage, int job) {
+    for (std::size_t page = 0; page < 128; page++) {
+        const std::size_t offset = ((static_cast<std::size_t>(job)*128+page)*storage.page_size)%MEMORY_BYTES;
+        storage.pages[offset] = static_cast<unsigned char>(job);
     }
 }
 using lab::File;
-static File open_artifact(const char *prefix, const char *extension) {
-    char path[PATH_MAX];
-    if (snprintf(path,sizeof(path),"%s.%s",prefix,extension) >= (int)sizeof(path)) {
-        errno = ENAMETOOLONG; return File{};
+static File open_artifact(std::string_view prefix, std::string_view extension) {
+    std::string path;
+    try {
+        path.reserve(prefix.size()+extension.size()+1);
+        path.append(prefix);
+        path.push_back('.');
+        path.append(extension);
+    } catch (const std::bad_alloc &) {
+        errno = ENOMEM;
+        return {};
     }
-    return File{fopen(path,"wb")};
+    return File{fopen(path.c_str(),"wb")};
 }
-static int save_media(const struct options *o, const struct buffers *b, int count) {
+static int save_media(const Options &options, const buffers &storage, int count) {
     File file;
-    if (!strcmp(o->mode,"audio")) {
-        file = open_artifact(o->output,"wav"); if (!file) return -1;
-        FILE *f = file.get();
-        lab::write_wav(f,std::span(b->audio).first((size_t)count*b->frames));
+    bool written = false;
+    if (options.mode == WorkloadMode::audio) {
+        file = open_artifact(options.output,"wav");
+        if (!file) return -1;
+        written = lab::write_wav(*file,std::span(storage.audio).first(
+            static_cast<std::size_t>(count)*storage.frames));
     } else {
-        file = open_artifact(o->output,"pgm"); if (!file) return -1;
-        FILE *f = file.get();
-        fprintf(f,"P5\n%d %d\n255\n",WIDTH,HEIGHT);
-        fwrite(b->image.data(),1,PIXELS,f);
+        file = open_artifact(options.output,"pgm");
+        if (!file) return -1;
+        written = fprintf(file.get(),"P5\n%d %d\n255\n",WIDTH,HEIGHT) >= 0 &&
+                  fwrite(storage.image.data(),1,PIXELS,file.get()) == PIXELS;
     }
-    int bad = ferror(file.get()); if (fclose(file.release())) bad = 1;
-    return bad ? -1 : 0;
+    const int write_error = errno;
+    const bool closed = lab::close(file);
+    if (!written) errno = write_error;
+    return written && closed ? 0 : -1;
 }
 
+class PthreadMutex {
+    pthread_mutex_t mutex_{};
+    bool initialized_ = false;
+public:
+    PthreadMutex() = default;
+    PthreadMutex(const PthreadMutex &) = delete;
+    PthreadMutex &operator=(const PthreadMutex &) = delete;
+    ~PthreadMutex() { if (initialized_) pthread_mutex_destroy(&mutex_); }
+
+    int initialize(const pthread_mutexattr_t &attributes) noexcept {
+        const int result = pthread_mutex_init(&mutex_,&attributes);
+        initialized_ = result == 0;
+        return result;
+    }
+    int lock() noexcept { return pthread_mutex_lock(&mutex_); }
+    int unlock() noexcept { return pthread_mutex_unlock(&mutex_); }
+    int close() noexcept {
+        if (!initialized_) return 0;
+        const int result = pthread_mutex_destroy(&mutex_);
+        if (!result) initialized_ = false;
+        return result;
+    }
+};
+
+struct ThreadResult {
+    const char *action = nullptr;
+    int error = 0;
+    void record(const char *failed_action, int result) noexcept {
+        if (result && !error) { action = failed_action; error = result; }
+    }
+};
+
 struct lock_state {
-    pthread_mutex_t mutex{};
+    explicit lock_state(std::array<buffers,2> &owned_buffers, int passes)
+        : storage(owned_buffers), work(passes) {}
+    PthreadMutex mutex;
     std::binary_semaphore locked{0}, low_go{0}, medium_go{0}, high_go{0};
     std::atomic<bool> abort{false};
-    buffers *b = nullptr;
-    uint64_t high_start = 0, high_finish = 0, low_finish = 0, medium_finish = 0;
-    int work = 0;
+    std::array<buffers,2> &storage;
+    std::array<ThreadResult,3> results{};
+    std::uint64_t high_start = 0, high_finish = 0, low_finish = 0, medium_finish = 0;
+    int work;
 };
 static void *low_thread(void *arg) {
     auto *s = static_cast<lock_state *>(arg);
-    pthread_mutex_lock(&s->mutex);
+    const int lock_result = s->mutex.lock();
+    if (lock_result) {
+        s->results[0].record("lock priority-inheritance mutex",lock_result);
+        s->abort = true;
+    }
     s->locked.release();
     s->low_go.acquire();
-    if (!s->abort)
-        for (int n = 0; n < 8; n++) video_work(&s->b[0],n,s->work);
-    s->low_finish = clock_ns(CLOCK_MONOTONIC);
-    pthread_mutex_unlock(&s->mutex);
-    return NULL;
+    if (!lock_result) {
+        if (!s->abort)
+            for (int n = 0; n < 8; n++) video_work(s->storage[0],n,s->work);
+        const auto finish = read_clock(CLOCK_MONOTONIC);
+        if (finish) s->low_finish = finish.nanoseconds;
+        else s->results[0].record("read low-thread clock",finish.error);
+        s->results[0].record("unlock priority-inheritance mutex",s->mutex.unlock());
+    }
+    return nullptr;
 }
 static void *medium_thread(void *arg) {
     auto *s = static_cast<lock_state *>(arg);
     s->medium_go.acquire();
     if (!s->abort)
-        for (int n = 0; n < 80; n++) video_work(&s->b[1],n,s->work);
-    s->medium_finish = clock_ns(CLOCK_MONOTONIC);
-    return NULL;
+        for (int n = 0; n < 80; n++) video_work(s->storage[1],n,s->work);
+    const auto finish = read_clock(CLOCK_MONOTONIC);
+    if (finish) s->medium_finish = finish.nanoseconds;
+    else s->results[1].record("read medium-thread clock",finish.error);
+    return nullptr;
 }
 static void *high_thread(void *arg) {
     auto *s = static_cast<lock_state *>(arg);
     s->high_go.acquire();
-    if (s->abort) return nullptr;
     s->medium_go.release();
     s->low_go.release();
-    s->high_start = clock_ns(CLOCK_MONOTONIC);
-    pthread_mutex_lock(&s->mutex);
-    s->high_finish = clock_ns(CLOCK_MONOTONIC);
-    pthread_mutex_unlock(&s->mutex);
-    return NULL;
-}
-static int start_thread(pthread_t *thread, void *(*fn)(void *), struct lock_state *s, int priority) {
-    pthread_attr_t attr;
-    struct sched_param param{};
-    param.sched_priority = priority;
-    int rc = pthread_attr_init(&attr);
-    if (rc) return rc;
-    if (!(rc = pthread_attr_setinheritsched(&attr,PTHREAD_EXPLICIT_SCHED)) &&
-        !(rc = pthread_attr_setschedpolicy(&attr,SCHED_FIFO)) &&
-        !(rc = pthread_attr_setschedparam(&attr,&param)))
-        rc = pthread_create(thread,&attr,fn,s);
-    pthread_attr_destroy(&attr);
-    return rc;
-}
-static int read_effective(struct effective *e) {
-    memset(e,0,sizeof(*e));
-    e->policy = thread_scheduler::policy();
-    if (e->policy < 0) return -1;
-    errno = 0;
-    e->nice_value = getpriority(PRIO_PROCESS,0);
-    if (errno || thread_scheduler::parameters(e->param) ||
-        sched_getaffinity(0,sizeof(e->cpus),&e->cpus)) return -1;
-    if (e->policy == SCHED_RR) {
-        struct timespec quantum;
-        if (sched_rr_get_interval(0,&quantum)) return -1;
-        e->rr_quantum_ns = (uint64_t)quantum.tv_sec*1000000000ULL+(uint64_t)quantum.tv_nsec;
+    if (s->abort) return nullptr;
+    const auto start = read_clock(CLOCK_MONOTONIC);
+    if (start) s->high_start = start.nanoseconds;
+    else s->results[2].record("read high-thread start clock",start.error);
+    const int lock_result = s->mutex.lock();
+    s->results[2].record("lock priority-inheritance mutex",lock_result);
+    if (!lock_result) {
+        const auto finish = read_clock(CLOCK_MONOTONIC);
+        if (finish) s->high_finish = finish.nanoseconds;
+        else s->results[2].record("read high-thread finish clock",finish.error);
+        s->results[2].record("unlock priority-inheritance mutex",s->mutex.unlock());
     }
-    if (e->policy == SCHED_DEADLINE) {
+    return nullptr;
+}
+struct ThreadStart {
+    bool created = false;
+    const char *action = nullptr;
+    int error = 0;
+};
+static ThreadStart start_thread(pthread_t &thread, void *(*entry)(void *),
+                                lock_state &state, int priority) {
+    pthread_attr_t attributes;
+    sched_param parameters{};
+    parameters.sched_priority = priority;
+    int result = pthread_attr_init(&attributes);
+    if (result) return {false,"initialize thread attributes",result};
+    const char *action = "configure explicit thread scheduling";
+    if (!(result = pthread_attr_setinheritsched(&attributes,PTHREAD_EXPLICIT_SCHED)) &&
+        !(result = pthread_attr_setschedpolicy(&attributes,SCHED_FIFO)) &&
+        !(result = pthread_attr_setschedparam(&attributes,&parameters))) {
+        action = "create FIFO thread";
+        result = pthread_create(&thread,&attributes,entry,&state);
+    }
+    const bool created = !result;
+    const int destroy_result = pthread_attr_destroy(&attributes);
+    if (!result && destroy_result)
+        return {created,"destroy thread attributes",destroy_result};
+    return {created,action,result};
+}
+static int read_effective(Effective &effective) {
+    effective = Effective{};
+    effective.policy = thread_scheduler::policy();
+    if (effective.policy < 0) return -1;
+    errno = 0;
+    effective.nice_value = getpriority(PRIO_PROCESS,0);
+    if (errno || thread_scheduler::parameters(effective.param) ||
+        sched_getaffinity(0,sizeof(effective.cpus),&effective.cpus)) return -1;
+    if (effective.policy == SCHED_RR) {
+        timespec quantum{};
+        if (sched_rr_get_interval(0,&quantum)) return -1;
+        effective.rr_quantum_ns = static_cast<std::uint64_t>(quantum.tv_sec)*1000000000ULL+
+                                  static_cast<std::uint64_t>(quantum.tv_nsec);
+    }
+    if (effective.policy == SCHED_DEADLINE) {
 #ifdef SYS_sched_getattr
-        if (syscall(SYS_sched_getattr,0,&e->attr,sizeof(e->attr),0)) return -1;
+        if (syscall(SYS_sched_getattr,0,&effective.attr,sizeof(effective.attr),0)) return -1;
 #else
         errno = ENOSYS; return -1;
 #endif
     }
     return 0;
 }
-static void emit_effective(const struct options *o, const struct effective *e) {
+static void emit_effective(const Options &options, const Effective &effective) {
     printf("\"build\":{\"cxx_standard\":%ld,\"compiler\":",static_cast<long>(__cplusplus));
-    json_string(stdout,__VERSION__);
+    json_string(*stdout,__VERSION__);
     printf("},");
     printf("\"requested\":{\"policy\":\"%s\",\"nice\":%d,\"priority\":%d,\"cpu\":%d},",
-           o->policy,o->nice_value,
-           (!strcmp(o->policy,"fifo") || !strcmp(o->policy,"rr")) ? o->priority : 0,o->cpu);
+           policy_name(options.policy),options.nice_value,
+           (options.policy == SchedulingPolicy::fifo || options.policy == SchedulingPolicy::rr) ?
+               options.priority : 0,
+           options.cpu);
     printf("\"effective\":{\"policy\":\"%s\",\"nice\":%d,\"priority\":%d,\"affinity\":[",
-           policy_name(e->policy),e->nice_value,e->param.sched_priority);
+           policy_name(effective.policy),effective.nice_value,effective.param.sched_priority);
     int sep = 0;
     for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
-        if (CPU_ISSET(cpu,&e->cpus)) { printf("%s%d",sep ? "," : "",cpu); sep = 1; }
+        if (CPU_ISSET(cpu,&effective.cpus)) { printf("%s%d",sep ? "," : "",cpu); sep = 1; }
     printf("],\"rr_quantum_ns\":%llu,\"runtime_ns\":%llu,\"deadline_ns\":%llu,\"period_ns\":%llu},",
-           (unsigned long long)e->rr_quantum_ns,(unsigned long long)e->attr.runtime,
-           (unsigned long long)e->attr.deadline,(unsigned long long)e->attr.period);
+           static_cast<unsigned long long>(effective.rr_quantum_ns),
+           static_cast<unsigned long long>(effective.attr.runtime),
+           static_cast<unsigned long long>(effective.attr.deadline),
+           static_cast<unsigned long long>(effective.attr.period));
 }
-static int demote(const struct options *o) {
-    struct sched_param zero{};
-    if (thread_scheduler::set(SCHED_OTHER,zero) && policy_id(o->policy) != SCHED_IDLE)
-        return failure("restore ordinary scheduling",errno,0);
+static int demote(const Options &options) {
+    sched_param zero{};
+    if (thread_scheduler::set(SCHED_OTHER,zero) && policy_id(options.policy) != SCHED_IDLE)
+        return failure("restore ordinary scheduling",errno,false);
     return 0;
 }
-static int lock_demo(const struct options *o, struct buffers *buffers) {
-    lock_state s;
-    s.b = buffers; s.work = o->work;
+static int lock_demo(const Options &options, std::array<buffers,2> &storage) {
+    lock_state state(storage,options.work);
     pthread_mutexattr_t attr;
     int rc = pthread_mutexattr_init(&attr);
-    if (rc) return failure("mutex attribute",rc,0);
-    rc = pthread_mutexattr_setprotocol(&attr,!strcmp(o->protocol,"inherit") ?
+    if (rc) return failure("initialize mutex attributes",rc,false);
+    rc = pthread_mutexattr_setprotocol(&attr,options.protocol == LockProtocol::inherit ?
                                       PTHREAD_PRIO_INHERIT : PTHREAD_PRIO_NONE);
-    if (!rc) rc = pthread_mutex_init(&s.mutex,&attr);
-    pthread_mutexattr_destroy(&attr);
+    if (!rc) rc = state.mutex.initialize(attr);
+    const int attr_destroy_result = pthread_mutexattr_destroy(&attr);
+    if (!rc) rc = attr_destroy_result;
     if (rc) return failure("mutex protocol",rc,optional_errno(rc));
     std::array<pthread_t,3> threads{};
     using Entry = void *(*)(void *);
     const std::array<Entry,3> entries{low_thread,medium_thread,high_thread};
-    size_t created = 0;
-    for (; created < threads.size(); created++) {
-        rc = start_thread(&threads[created],entries[created],&s,o->priority+static_cast<int>(created));
-        if (rc) break;
+    std::size_t created = 0;
+    const char *start_action = nullptr;
+    for (std::size_t index = 0; index < threads.size(); index++) {
+        const auto started = start_thread(threads[index],entries[index],state,
+                                          options.priority+static_cast<int>(index));
+        if (started.created) created++;
+        if (started.error) { rc = started.error; start_action = started.action; break; }
     }
     if (rc) {
-        s.abort = true;
-        s.low_go.release(); s.medium_go.release(); s.high_go.release();
+        state.abort = true;
+        if (created == threads.size()) state.high_go.release();
+        else {
+            state.low_go.release();
+            state.medium_go.release();
+        }
     } else {
-        s.locked.acquire();
-        s.high_go.release();
+        state.locked.acquire();
+        state.high_go.release();
     }
-    for (pthread_t thread : std::span(threads).first(created)) pthread_join(thread,nullptr);
-    if (rc) { pthread_mutex_destroy(&s.mutex); return failure("create FIFO thread",rc,optional_errno(rc)); }
-    struct effective effective;
-    if (read_effective(&effective)) return failure("read effective scheduler",errno,0);
-    if ((rc = demote(o))) return rc;
-    auto file = open_artifact(o->output,"csv");
-    if (!file) return failure("open lock CSV",errno,0);
-    FILE *f = file.get();
-    fprintf(f,"index,release_ns,start_ns,finish_ns,cpu_ns\n0,%llu,%llu,%llu,0\n",
-            (unsigned long long)s.high_start,(unsigned long long)s.high_start,
-            (unsigned long long)s.high_finish);
-    if (fclose(file.release())) return failure("write lock CSV",errno,0);
+    int join_error = 0;
+    for (const pthread_t thread : std::span(threads).first(created)) {
+        const int result = pthread_join(thread,nullptr);
+        if (!join_error && result) join_error = result;
+    }
+    const int mutex_destroy_result = state.mutex.close();
+    if (rc) return failure(start_action,rc,optional_errno(rc));
+    if (join_error) return failure("join FIFO thread",join_error,false);
+    for (const auto &result : state.results)
+        if (result.error) return failure(result.action,result.error,false);
+    if (mutex_destroy_result) return failure("destroy priority-inheritance mutex",mutex_destroy_result,false);
+    Effective effective;
+    if (read_effective(effective)) return failure("read effective scheduler",errno,false);
+    if ((rc = demote(options))) return rc;
+    auto file = open_artifact(options.output,"csv");
+    if (!file) return failure("open lock CSV",errno,false);
+    const bool written = fprintf(file.get(),
+        "index,release_ns,start_ns,finish_ns,cpu_ns\n0,%llu,%llu,%llu,0\n",
+        static_cast<unsigned long long>(state.high_start),
+        static_cast<unsigned long long>(state.high_start),
+        static_cast<unsigned long long>(state.high_finish)) >= 0;
+    const int write_error = errno;
+    const bool closed = lab::close(file);
+    if (!written) errno = write_error;
+    if (!written || !closed) return failure("write lock CSV",errno,false);
     printf("{\"schema_version\":1,\"status\":\"ok\",\"mode\":\"lock\",");
-    emit_effective(o,&effective);
+    emit_effective(options,effective);
     printf("\"lock\":{\"protocol\":\"%s\",\"high_wait_ns\":%llu,"
            "\"low_finish_ns\":%llu,\"medium_finish_ns\":%llu,"
            "\"low_priority\":%d,\"medium_priority\":%d,\"high_priority\":%d},",
-           o->protocol,(unsigned long long)(s.high_finish-s.high_start),
-           (unsigned long long)s.low_finish,(unsigned long long)s.medium_finish,
-           o->priority,o->priority+1,o->priority+2);
-    pthread_mutex_destroy(&s.mutex);
+           protocol_name(options.protocol),
+           static_cast<unsigned long long>(state.high_finish-state.high_start),
+           static_cast<unsigned long long>(state.low_finish),
+           static_cast<unsigned long long>(state.medium_finish),
+           options.priority,options.priority+1,options.priority+2);
     puts("\"samples\":1,\"period_ns\":0}");
     return 0;
 }
-static int worker(const struct options *o) {
-    std::array<buffers,2> b;
-    int rc = allocate(&b[0],o); if (rc) return rc;
-    if (!strcmp(o->mode,"lock")) { rc = allocate(&b[1],o); if (rc) return rc; }
-    if (o->cpu >= 0) {
-        cpu_set_t cpus; CPU_ZERO(&cpus); CPU_SET(o->cpu,&cpus);
+static int worker(const Options &options) {
+    std::array<buffers,2> storage;
+    int rc = allocate(storage[0],options);
+    if (rc) return rc;
+    if (options.mode == WorkloadMode::lock) {
+        rc = allocate(storage[1],options);
+        if (rc) return rc;
+    }
+    if (options.cpu >= 0) {
+        cpu_set_t cpus;
+        CPU_ZERO(&cpus);
+        CPU_SET(options.cpu,&cpus);
         if (sched_setaffinity(0,sizeof(cpus),&cpus))
             return failure("set affinity",errno,optional_errno(errno));
     }
-    if (o->allow_rt) {
-        struct rlimit limit = {1000000,2000000};
-        struct rlimit old;
-        if (getrlimit(RLIMIT_RTTIME,&old)) return failure("get RLIMIT_RTTIME",errno,0);
+    if (options.allow_rt) {
+        rlimit limit = {1000000,2000000};
+        rlimit old{};
+        if (getrlimit(RLIMIT_RTTIME,&old)) return failure("get RLIMIT_RTTIME",errno,false);
         if (old.rlim_max < limit.rlim_max) limit.rlim_max = old.rlim_max;
         if (limit.rlim_cur > limit.rlim_max) limit.rlim_cur = limit.rlim_max;
-        if (setrlimit(RLIMIT_RTTIME,&limit)) return failure("set RLIMIT_RTTIME",errno,0);
+        if (setrlimit(RLIMIT_RTTIME,&limit)) return failure("set RLIMIT_RTTIME",errno,false);
     }
     /* Warm-up the processing code, not the demand-fault probe. */
-    for (int n = 0; n < o->warmup; n++) {
-        if (!strcmp(o->mode,"audio")) audio_work(&b[0],n,o->work,0);
-        else video_work(&b[0],n,o->work);
+    for (int n = 0; n < options.warmup; n++) {
+        if (options.mode == WorkloadMode::audio) audio_work(storage[0],n,options.work,false);
+        else video_work(storage[0],n,options.work);
     }
-    if (set_policy(o)) return failure("set scheduler/nice",errno,optional_errno(errno));
-    if (thread_scheduler::policy() != policy_id(o->policy))
+    if (set_policy(options)) return failure("set scheduler/nice",errno,optional_errno(errno));
+    if (thread_scheduler::policy() != policy_id(options.policy))
         return status("error","effective scheduler does not match request",1);
-    if (!strcmp(o->mode,"lock")) return lock_demo(o,b.data());
-    uint64_t now = clock_ns(CLOCK_MONOTONIC);
-    uint64_t origin = o->start_ns ? o->start_ns : now+20000000ULL;
+    if (options.mode == WorkloadMode::lock) return lock_demo(options,storage);
+    const auto current = read_clock(CLOCK_MONOTONIC);
+    if (!current) return failure("read monotonic clock",current.error,false);
+    const std::uint64_t now = current.nanoseconds;
+    const std::uint64_t origin = options.start_ns ? options.start_ns : now+20000000ULL;
     if (origin < now || origin-now > 2000000000ULL)
         return status("error","start-ns must be in the next two seconds (warmup may have overrun it)",1);
     if (sleep_until(origin)) return status("error","initial sleep interrupted",1);
-    struct rusage before, after;
-    getrusage(RUSAGE_SELF,&before);
+    rusage before{};
+    rusage after{};
+    const bool before_available = getrusage(RUSAGE_SELF,&before) == 0;
+    int rusage_error = before_available ? 0 : errno;
     int count = 0;
-    uint64_t end = origin+(uint64_t)o->duration_ms*1000000ULL;
-    int periodic = strcmp(o->mode,"offline") != 0;
-    while (count < (o->duration_ms ? MAX_SAMPLES : o->jobs)) {
-        struct sample *s = &b[0].samples[count];
-        s->release = periodic ? origin+(uint64_t)count*o->period_us*1000 : origin;
-        if (periodic && sleep_until(s->release)) return status("error","periodic sleep interrupted",1);
-        s->start = clock_ns(CLOCK_MONOTONIC);
-        if (o->duration_ms && s->start >= end) break;
-        uint64_t cpu_start = clock_ns(CLOCK_THREAD_CPUTIME_ID);
-        probe_pages(&b[0],count);
-        if (!strcmp(o->mode,"audio")) audio_work(&b[0],count,o->work,1);
-        else video_work(&b[0],count,o->work);
-        s->cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID)-cpu_start;
-        s->finish = clock_ns(CLOCK_MONOTONIC);
+    const std::uint64_t end = origin+static_cast<std::uint64_t>(options.duration_ms)*1000000ULL;
+    const bool periodic = options.mode != WorkloadMode::offline;
+    while (count < (options.duration_ms ? MAX_SAMPLES : options.jobs)) {
+        Sample &sample = storage[0].samples[count];
+        sample.release = periodic ? origin+static_cast<std::uint64_t>(count)*options.period_us*1000 : origin;
+        if (periodic && sleep_until(sample.release))
+            return status("error","periodic sleep interrupted",1);
+        const auto start = read_clock(CLOCK_MONOTONIC);
+        if (!start) return failure("read job start clock",start.error,false);
+        sample.start = start.nanoseconds;
+        if (options.duration_ms && sample.start >= end) break;
+        const auto cpu_start = read_clock(CLOCK_THREAD_CPUTIME_ID);
+        if (!cpu_start) return failure("read thread CPU clock",cpu_start.error,false);
+        probe_pages(storage[0],count);
+        if (options.mode == WorkloadMode::audio)
+            audio_work(storage[0],count,options.work,true);
+        else
+            video_work(storage[0],count,options.work);
+        const auto cpu_finish = read_clock(CLOCK_THREAD_CPUTIME_ID);
+        if (!cpu_finish) return failure("read thread CPU clock",cpu_finish.error,false);
+        sample.cpu = cpu_finish.nanoseconds-cpu_start.nanoseconds;
+        const auto finish = read_clock(CLOCK_MONOTONIC);
+        if (!finish) return failure("read job finish clock",finish.error,false);
+        sample.finish = finish.nanoseconds;
         count++;
         if (interrupted) return status("error","worker interrupted",1);
-        if (o->duration_ms && s->finish >= end) break;
+        if (options.duration_ms && sample.finish >= end) break;
     }
-    getrusage(RUSAGE_SELF,&after);
-    if (o->duration_ms && count == MAX_SAMPLES && b[0].samples[count-1].finish < end)
+    const bool after_available = getrusage(RUSAGE_SELF,&after) == 0;
+    if (!after_available && !rusage_error) rusage_error = errno;
+    const bool rusage_available = before_available && after_available;
+    if (options.duration_ms && count == MAX_SAMPLES && storage[0].samples[count-1].finish < end)
         return status("error","sample capacity exceeded; increase work or shorten duration",1);
     /* Return to ordinary scheduling before writing artifacts. */
-    struct effective effective;
-    if (read_effective(&effective)) return failure("read effective scheduler",errno,0);
-    if ((rc = demote(o))) return rc;
-    auto file = open_artifact(o->output,"csv");
-    if (!file) { fprintf(stderr,"open CSV: %s\n",strerror(errno)); return 1; }
-    FILE *f = file.get();
-    fprintf(f,"index,release_ns,start_ns,finish_ns,cpu_ns\n");
+    Effective effective;
+    if (read_effective(effective)) return failure("read effective scheduler",errno,false);
+    if ((rc = demote(options))) return rc;
+    auto file = open_artifact(options.output,"csv");
+    if (!file) return failure("open CSV",errno,false);
+    bool csv_written = fprintf(file.get(),"index,release_ns,start_ns,finish_ns,cpu_ns\n") >= 0;
     for (int n = 0; n < count; n++) {
-        const struct sample *s = &b[0].samples[n];
-        fprintf(f,"%d,%llu,%llu,%llu,%llu\n",n,(unsigned long long)s->release,
-                (unsigned long long)s->start,(unsigned long long)s->finish,
-                (unsigned long long)s->cpu);
+        const Sample &sample = storage[0].samples[n];
+        if (csv_written)
+            csv_written = fprintf(file.get(),"%d,%llu,%llu,%llu,%llu\n",n,
+                static_cast<unsigned long long>(sample.release),
+                static_cast<unsigned long long>(sample.start),
+                static_cast<unsigned long long>(sample.finish),
+                static_cast<unsigned long long>(sample.cpu)) >= 0;
     }
-    if (fclose(file.release()) || save_media(o,&b[0],count)) {
-        fprintf(stderr,"write artifacts: %s\n",strerror(errno)); return 1;
+    const int csv_error = errno;
+    const bool csv_closed = lab::close(file);
+    if (!csv_written) errno = csv_error;
+    if (!csv_written || !csv_closed || save_media(options,storage[0],count))
+        return failure("write artifacts",errno ? errno : EIO,false);
+    printf("{\"schema_version\":1,\"status\":\"ok\",\"mode\":\"%s\",",mode_name(options.mode));
+    emit_effective(options,effective);
+    const std::uint64_t elapsed = count ? storage[0].samples[count-1].finish-origin :
+        static_cast<std::uint64_t>(options.duration_ms)*1000000;
+    printf("\"samples\":%d,\"period_ns\":%llu,\"elapsed_ns\":%llu,\"window_ns\":%llu,"
+           "\"checksum\":%llu,\"rusage_available\":%s,",
+           count,static_cast<unsigned long long>(periodic ?
+               static_cast<std::uint64_t>(options.period_us)*1000 : 0),
+           static_cast<unsigned long long>(elapsed),
+           static_cast<unsigned long long>(static_cast<std::uint64_t>(options.duration_ms)*1000000),
+           static_cast<unsigned long long>(storage[0].checksum),
+           rusage_available ? "true" : "false");
+    if (rusage_available) {
+        printf("\"minor_faults\":%ld,\"major_faults\":%ld,\"voluntary_cs\":%ld,"
+               "\"involuntary_cs\":%ld,\"rusage_error\":null,",
+               after.ru_minflt-before.ru_minflt,after.ru_majflt-before.ru_majflt,
+               after.ru_nvcsw-before.ru_nvcsw,after.ru_nivcsw-before.ru_nivcsw);
+    } else {
+        printf("\"minor_faults\":null,\"major_faults\":null,\"voluntary_cs\":null,"
+               "\"involuntary_cs\":null,\"rusage_error\":%d,",rusage_error);
     }
-    printf("{\"schema_version\":1,\"status\":\"ok\",\"mode\":\"%s\",",o->mode);
-    emit_effective(o,&effective);
-    uint64_t elapsed = count ? b[0].samples[count-1].finish-origin : (uint64_t)o->duration_ms*1000000;
-    printf("\"samples\":%d,\"period_ns\":%llu,\"elapsed_ns\":%llu,\"window_ns\":%llu,\"checksum\":%llu,"
-           "\"minor_faults\":%ld,\"major_faults\":%ld,\"voluntary_cs\":%ld,"
-           "\"involuntary_cs\":%ld,\"memory\":\"%s\",\"work\":%d,\"warmup\":%d,"
+    printf("\"memory\":\"%s\",\"work\":%d,\"warmup\":%d,"
            "\"deadline\":{\"runtime_us\":%d,\"deadline_us\":%d,\"period_us\":%d}}\n",
-           count,(unsigned long long)(periodic ? (uint64_t)o->period_us*1000 : 0),
-           (unsigned long long)elapsed,(unsigned long long)((uint64_t)o->duration_ms*1000000),
-           (unsigned long long)b[0].checksum,after.ru_minflt-before.ru_minflt,
-           after.ru_majflt-before.ru_majflt,after.ru_nvcsw-before.ru_nvcsw,
-           after.ru_nivcsw-before.ru_nivcsw,o->memory,o->work,o->warmup,
-           o->runtime_us,o->deadline_us,o->period_us);
+           memory_name(options.memory),options.work,options.warmup,
+           options.runtime_us,options.deadline_us,options.period_us);
     return 0;
 }
+static int flush_stdout(int result) noexcept {
+    if (fflush(stdout) == 0) return result;
+    const int output_error = errno;
+    fprintf(stderr,"write standard output: %s (%d)\n",strerror(output_error),output_error);
+    fflush(stderr);
+    return result == 0 ? 1 : result;
+}
+
+static int kill_and_reap(pid_t child) noexcept {
+    int first_error = 0;
+    if (kill(child,SIGKILL) && errno != ESRCH) first_error = errno;
+    for (;;) {
+        if (waitpid(child,nullptr,0) >= 0) break;
+        if (errno == EINTR) continue;
+        if (errno != ECHILD && !first_error) first_error = errno;
+        break;
+    }
+    return first_error;
+}
+
 int main(int argc, char **argv) {
-    struct options o = parse(argc,argv);
-    int p = policy_id(o.policy);
-    int rt = p == SCHED_FIFO || p == SCHED_RR || p == SCHED_DEADLINE;
-    cpu_set_t allowed; CPU_ZERO(&allowed);
+    const ParseResult parsed = parse(argc,argv);
+    if (parsed.status == ParseStatus::help) { usage(); return flush_stdout(0); }
+    if (parsed.status == ParseStatus::invalid) return 2;
+    const Options &options = parsed.options;
+    const int policy = policy_id(options.policy);
+    const bool real_time = policy == SCHED_FIFO || policy == SCHED_RR || policy == SCHED_DEADLINE;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
     if (sched_getaffinity(0,sizeof(allowed),&allowed))
-        return failure("read allowed CPUs (CPU_SETSIZE bound)",errno,0);
-    if (o.cpu >= 0 && !CPU_ISSET(o.cpu,&allowed)) {
+        return failure("read allowed CPUs (CPU_SETSIZE bound)",errno,false);
+    if (options.cpu >= 0 && !CPU_ISSET(options.cpu,&allowed)) {
         fprintf(stderr,"requested CPU is not in the effective allowed mask\n"); return 2;
     }
     int initial_policy = thread_scheduler::policy();
@@ -621,37 +956,63 @@ int main(int argc, char **argv) {
     if (errno) return failure("inspect guardian nice",errno,optional_errno(errno));
     if (initial_policy != SCHED_OTHER || initial_nice > 0)
         return status("skipped","guardian requires SCHED_OTHER and nice <= 0; do not launch via chrt/nice",77);
-    if (rt && !o.allow_rt) return status("skipped","RT requires explicit --allow-rt",77);
-    if (rt && CPU_COUNT(&allowed) < 2)
+    if (real_time && !options.allow_rt) return status("skipped","RT requires explicit --allow-rt",77);
+    if (real_time && CPU_COUNT(&allowed) < 2)
         return status("skipped","RT requires at least two allowed CPUs for housekeeping",77);
-    if (rt && p != SCHED_DEADLINE && o.cpu < 0)
+    if (real_time && policy != SCHED_DEADLINE && options.cpu < 0)
         return status("skipped","FIFO/RR require an explicit worker CPU, leaving another for watchdog",77);
-    struct sigaction sa;
-    memset(&sa,0,sizeof(sa)); sa.sa_handler = handle_signal;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGTERM,&sa,NULL); sigaction(SIGINT,&sa,NULL);
+    struct sigaction action{};
+    action.sa_handler = handle_signal;
+    if (sigemptyset(&action.sa_mask) || sigaction(SIGTERM,&action,nullptr) ||
+        sigaction(SIGINT,&action,nullptr))
+        return failure("install guardian signal handlers",errno,false);
     /* DEADLINE inherits the original domain-wide mask, never the watchdog's pin. */
     pid_t child = fork();
-    if (child < 0) return failure("fork guardian",errno,0);
-    if (child == 0) { int rc = worker(&o); fflush(stdout); _exit(rc); }
-    if (rt) {
-        cpu_set_t guard; CPU_ZERO(&guard);
+    if (child < 0) return failure("fork guardian",errno,false);
+    if (child == 0) {
+        const int result = worker(options);
+        _exit(flush_stdout(result));
+    }
+    if (real_time) {
+        cpu_set_t guard;
+        CPU_ZERO(&guard);
         for (int i = 0; i < CPU_SETSIZE; i++)
-            if (CPU_ISSET(i,&allowed) && i != o.cpu) { CPU_SET(i,&guard); break; }
+            if (CPU_ISSET(i,&allowed) && i != options.cpu) { CPU_SET(i,&guard); break; }
         if (sched_setaffinity(0,sizeof(guard),&guard)) {
-            int err = errno; kill(child,SIGKILL); waitpid(child,NULL,0);
-            return failure("pin watchdog",err,0);
+            const int affinity_error = errno;
+            const int cleanup_error = kill_and_reap(child);
+            return failure(cleanup_error ? "terminate worker after watchdog affinity failure" :
+                                          "pin watchdog",
+                           cleanup_error ? cleanup_error : affinity_error,false);
         }
     }
-    uint64_t stop = clock_ns(CLOCK_MONOTONIC)+(uint64_t)o.timeout_ms*1000000;
+    const auto start = read_clock(CLOCK_MONOTONIC);
+    if (!start) {
+        const int cleanup_error = kill_and_reap(child);
+        return failure(cleanup_error ? "terminate worker after clock failure" : "read watchdog clock",
+                       cleanup_error ? cleanup_error : start.error,false);
+    }
+    const std::uint64_t stop = start.nanoseconds+
+                               static_cast<std::uint64_t>(options.timeout_ms)*1000000;
     int wstatus = 0;
     for (;;) {
-        pid_t rc = waitpid(child,&wstatus,WNOHANG);
-        if (rc == child) break;
-        if (rc < 0 && errno != EINTR) return failure("waitpid",errno,0);
-        if (interrupted || clock_ns(CLOCK_MONOTONIC) >= stop) {
-            kill(child,SIGKILL);
-            while (waitpid(child,NULL,0) < 0 && errno == EINTR) {}
+        const pid_t wait_result = waitpid(child,&wstatus,WNOHANG);
+        if (wait_result == child) break;
+        if (wait_result < 0 && errno != EINTR) {
+            const int wait_error = errno;
+            const int cleanup_error = kill_and_reap(child);
+            return failure(cleanup_error ? "terminate worker after wait failure" : "wait for worker",
+                           cleanup_error ? cleanup_error : wait_error,false);
+        }
+        const auto current = read_clock(CLOCK_MONOTONIC);
+        if (!current) {
+            const int cleanup_error = kill_and_reap(child);
+            return failure(cleanup_error ? "terminate worker after clock failure" : "read watchdog clock",
+                           cleanup_error ? cleanup_error : current.error,false);
+        }
+        if (interrupted || current.nanoseconds >= stop) {
+            const int cleanup_error = kill_and_reap(child);
+            if (cleanup_error) return failure("terminate worker",cleanup_error,false);
             return status("error",interrupted ? "interrupted; worker killed" :
                           "wall-clock watchdog expired; worker killed",1);
         }

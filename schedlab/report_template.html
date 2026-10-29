@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>@@PAGE_TITLE@@</title>
+  <style>
+    :root {
+      --bg: #071018;
+      --bg-elevated: #0b1721;
+      --panel: rgba(15, 30, 42, .88);
+      --panel-solid: #0f1e2a;
+      --panel-hover: #142838;
+      --text: #ecf4f6;
+      --muted: #8fa5ae;
+      --faint: #617580;
+      --line: rgba(157, 188, 198, .16);
+      --line-strong: rgba(157, 188, 198, .28);
+      --accent: #45dbc4;
+      --accent-soft: rgba(69, 219, 196, .14);
+      --blue: #83a8ff;
+      --amber: #ffbd66;
+      --red: #ff7585;
+      --green: #63dfa3;
+      --shadow: 0 24px 70px rgba(0, 0, 0, .32);
+      --radius: 18px;
+      --mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    :root[data-theme="light"] {
+      --bg: #edf3f3;
+      --bg-elevated: #f8fbfa;
+      --panel: rgba(255, 255, 255, .9);
+      --panel-solid: #fff;
+      --panel-hover: #f0f7f6;
+      --text: #10232b;
+      --muted: #526c75;
+      --faint: #758b92;
+      --line: rgba(24, 64, 74, .13);
+      --line-strong: rgba(24, 64, 74, .23);
+      --accent: #087e72;
+      --accent-soft: rgba(8, 126, 114, .1);
+      --blue: #355fcb;
+      --amber: #a75c00;
+      --red: #c63850;
+      --green: #087c4a;
+      --shadow: 0 24px 70px rgba(32, 64, 68, .12);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 12% -8%, rgba(69, 219, 196, .13), transparent 34rem),
+        radial-gradient(circle at 92% 4%, rgba(131, 168, 255, .12), transparent 30rem),
+        var(--bg);
+      font: 15px/1.55 var(--sans);
+      min-height: 100vh;
+    }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    button, input, select { font: inherit; }
+    button, select, input { color: var(--text); }
+    button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible {
+      outline: 3px solid color-mix(in srgb, var(--accent) 55%, transparent);
+      outline-offset: 2px;
+    }
+    .shell { width: min(1480px, calc(100% - 32px)); margin: 0 auto; padding-bottom: 72px; }
+    .hero { padding: 30px 0 26px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 54px; }
+    .brand { display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font: 700 12px/1 var(--mono); letter-spacing: .15em; text-transform: uppercase; }
+    .brand-mark { display: grid; place-items: center; width: 31px; height: 31px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--accent-soft); color: var(--accent); }
+    .brand-mark svg { width: 18px; height: 18px; }
+    .theme-button { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 8px 13px; cursor: pointer; color: var(--muted); }
+    .theme-button:hover { color: var(--text); border-color: var(--line-strong); }
+    .hero-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(270px, .6fr); align-items: end; gap: 46px; }
+    .eyebrow { margin: 0 0 14px; color: var(--accent); font: 700 12px/1 var(--mono); letter-spacing: .16em; text-transform: uppercase; }
+    h1 { max-width: 920px; margin: 0; font-size: clamp(38px, 6vw, 78px); line-height: .98; letter-spacing: -.055em; font-weight: 690; }
+    .hero-copy { margin: 24px 0 0; max-width: 850px; color: var(--muted); font-size: clamp(16px, 2vw, 20px); }
+    .hero-meta { border-left: 1px solid var(--line-strong); padding-left: 24px; color: var(--muted); }
+    .hero-meta strong { display: block; color: var(--text); font-size: 14px; margin-bottom: 8px; }
+    .hero-meta p { margin: 0 0 14px; }
+    .status { display: inline-flex; align-items: center; gap: 7px; width: max-content; padding: 4px 9px; border-radius: 999px; font: 700 11px/1 var(--mono); letter-spacing: .04em; text-transform: uppercase; }
+    .status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .status-ok { color: var(--green); background: color-mix(in srgb, var(--green) 12%, transparent); }
+    .status-skipped, .status-comparison { color: var(--amber); background: color-mix(in srgb, var(--amber) 12%, transparent); }
+    .status-error, .status-interrupted { color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); }
+    .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 28px 0 14px; }
+    .summary-card { position: relative; overflow: hidden; min-height: 138px; padding: 20px; border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(145deg, var(--panel), color-mix(in srgb, var(--panel-solid) 86%, transparent)); box-shadow: var(--shadow); }
+    .summary-card::after { content: ""; position: absolute; right: -20px; bottom: -35px; width: 100px; height: 100px; border-radius: 50%; background: var(--accent-soft); filter: blur(4px); }
+    .summary-label { color: var(--muted); font: 700 11px/1.2 var(--mono); letter-spacing: .11em; text-transform: uppercase; }
+    .summary-value { position: relative; z-index: 1; display: block; margin-top: 22px; font: 650 clamp(26px, 3.4vw, 43px)/1 var(--mono); letter-spacing: -.05em; }
+    .summary-detail { display: block; margin-top: 9px; color: var(--faint); font-size: 12px; }
+    .notice { display: grid; grid-template-columns: 22px 1fr; gap: 12px; margin: 14px 0 28px; padding: 15px 17px; border: 1px solid color-mix(in srgb, var(--amber) 30%, var(--line)); border-radius: 14px; background: color-mix(in srgb, var(--amber) 7%, var(--panel)); color: var(--muted); }
+    .notice svg { color: var(--amber); margin-top: 2px; }
+    .notice strong { color: var(--text); }
+    .panel { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); backdrop-filter: blur(14px); }
+    .controls { display: grid; grid-template-columns: minmax(220px, 1.4fr) repeat(3, minmax(150px, .7fr)) auto; gap: 12px; padding: 15px; margin-bottom: 14px; }
+    .field label { display: block; margin: 0 0 7px 2px; color: var(--faint); font: 700 10px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .field input, .field select { width: 100%; height: 42px; padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-elevated); }
+    .field input::placeholder { color: var(--faint); }
+    .toggle-wrap { display: flex; align-items: end; padding-bottom: 4px; }
+    .toggle { display: flex; align-items: center; gap: 9px; min-height: 38px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+    .toggle input { width: 17px; height: 17px; accent-color: var(--accent); }
+    .view-status { display: flex; justify-content: space-between; gap: 16px; color: var(--faint); margin: 0 3px 20px; font: 12px/1.4 var(--mono); }
+    .charts { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(340px, .85fr); gap: 14px; }
+    .chart-panel { min-width: 0; padding: 22px; }
+    .panel-heading { display: flex; align-items: start; justify-content: space-between; gap: 18px; margin-bottom: 23px; }
+    .kicker { color: var(--accent); font: 700 10px/1 var(--mono); letter-spacing: .13em; text-transform: uppercase; }
+    h2 { margin: 6px 0 0; font-size: clamp(20px, 2.5vw, 29px); line-height: 1.15; letter-spacing: -.025em; }
+    .panel-heading p { max-width: 420px; margin: 5px 0 0; color: var(--muted); font-size: 13px; }
+    .chart-legend { display: flex; flex-wrap: wrap; justify-content: end; gap: 10px; color: var(--faint); font: 10px/1 var(--mono); }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .legend-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--blue); }
+    .legend-dot.p95 { background: var(--accent); }
+    .legend-dot.p99 { background: var(--amber); }
+    .legend-dot.max { background: var(--red); }
+    .ranking, .fingerprints { display: grid; gap: 12px; min-height: 230px; max-height: 630px; overflow: auto; padding: 2px 5px 4px 0; scrollbar-color: var(--line-strong) transparent; }
+    .rank-row { display: grid; grid-template-columns: minmax(115px, 32%) 1fr 86px; align-items: center; gap: 11px; }
+    .run-name { min-width: 0; color: var(--muted); font: 11px/1.25 var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bar-track { height: 11px; border-radius: 999px; background: color-mix(in srgb, var(--line) 70%, transparent); overflow: hidden; }
+    .bar { height: 100%; min-width: 2px; border-radius: inherit; background: linear-gradient(90deg, var(--blue), var(--accent)); box-shadow: 0 0 18px color-mix(in srgb, var(--accent) 30%, transparent); transform-origin: left; animation: grow .45s ease both; }
+    .rank-value { text-align: right; font: 11px/1 var(--mono); }
+    @keyframes grow { from { transform: scaleX(0); } }
+    .fingerprint-row { display: grid; grid-template-columns: minmax(115px, 32%) 1fr; align-items: center; gap: 11px; min-height: 24px; }
+    .fingerprint-track { position: relative; height: 22px; border-bottom: 1px solid var(--line); }
+    .fingerprint-line { position: absolute; top: 10px; height: 2px; border-radius: 2px; background: var(--line-strong); }
+    .fingerprint-dot { position: absolute; top: 6px; width: 9px; height: 9px; border: 2px solid var(--panel-solid); border-radius: 50%; transform: translateX(-50%); background: var(--blue); }
+    .fingerprint-dot.p95 { background: var(--accent); }
+    .fingerprint-dot.p99 { background: var(--amber); }
+    .fingerprint-dot.max { background: var(--red); }
+    .axis { display: flex; justify-content: space-between; color: var(--faint); font: 9px/1 var(--mono); margin: 8px 0 0 calc(32% + 11px); }
+    .empty { display: grid; place-items: center; min-height: 220px; border: 1px dashed var(--line-strong); border-radius: 13px; color: var(--faint); text-align: center; padding: 24px; }
+    .insights { display: grid; gap: 10px; margin: 14px 0 0; padding: 0; list-style: none; }
+    .insights li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; padding: 11px; border-radius: 11px; background: var(--bg-elevated); color: var(--muted); font-size: 12px; }
+    .insight-number { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); font: 700 10px/1 var(--mono); }
+    .insights strong { color: var(--text); font-weight: 650; }
+    .section { margin-top: 14px; padding: 22px; }
+    .table-scroll { overflow: auto; margin: 0 -22px -22px; border-radius: 0 0 var(--radius) var(--radius); }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 13px 12px; border-top: 1px solid var(--line); text-align: left; vertical-align: top; white-space: nowrap; }
+    th { position: sticky; top: 0; z-index: 2; color: var(--faint); background: var(--panel-solid); font: 700 9px/1.2 var(--mono); letter-spacing: .075em; text-transform: uppercase; }
+    th:first-child, td:first-child { padding-left: 22px; }
+    th:last-child, td:last-child { padding-right: 22px; }
+    tbody tr { transition: background .15s ease; }
+    tbody tr:hover { background: var(--panel-hover); }
+    td:first-child { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+    td:last-child { color: var(--muted); max-width: 410px; overflow: hidden; text-overflow: ellipsis; }
+    .sort { display: inline-flex; align-items: center; gap: 5px; border: 0; padding: 0; color: inherit; background: none; cursor: pointer; font: inherit; letter-spacing: inherit; text-transform: inherit; }
+    .sort::after { content: "↕"; opacity: .4; }
+    .sort[data-active="asc"]::after { content: "↑"; opacity: 1; color: var(--accent); }
+    .sort[data-active="desc"]::after { content: "↓"; opacity: 1; color: var(--accent); }
+    tr[hidden] { display: none; }
+    details { border-top: 1px solid var(--line); }
+    details:first-of-type { border-top: 0; }
+    summary { padding: 17px 0; cursor: pointer; color: var(--text); font-weight: 650; }
+    summary::marker { color: var(--accent); }
+    pre { max-height: 620px; overflow: auto; margin: 0 0 18px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.6 var(--mono); }
+    .method { color: var(--muted); max-width: 980px; }
+    .footer { display: flex; justify-content: space-between; gap: 20px; margin-top: 20px; color: var(--faint); font: 11px/1.5 var(--mono); }
+    .noscript { margin: 14px 0; padding: 14px; border: 1px solid var(--amber); border-radius: 12px; color: var(--muted); }
+    @media (max-width: 1050px) {
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .controls { grid-template-columns: 1fr 1fr; }
+      .charts { grid-template-columns: 1fr; }
+      .toggle-wrap { align-items: center; }
+    }
+    @media (max-width: 680px) {
+      .shell { width: min(100% - 20px, 1480px); }
+      .topbar { margin-bottom: 36px; }
+      .hero-grid { grid-template-columns: 1fr; gap: 28px; }
+      .hero-meta { border-left: 0; border-top: 1px solid var(--line); padding: 20px 0 0; }
+      .summary-grid { grid-template-columns: 1fr 1fr; }
+      .summary-card { min-height: 118px; padding: 16px; }
+      .summary-value { font-size: 25px; margin-top: 19px; }
+      .controls { grid-template-columns: 1fr; }
+      .rank-row, .fingerprint-row { grid-template-columns: 95px 1fr; }
+      .rank-value { grid-column: 2; margin-top: -7px; }
+      .axis { margin-left: 106px; }
+      .chart-panel, .section { padding: 17px; }
+      .table-scroll { margin-left: -17px; margin-right: -17px; margin-bottom: -17px; }
+      .footer { display: block; }
+    }
+    @media print {
+      :root { --bg: #fff; --panel: #fff; --panel-solid: #fff; --text: #111; --muted: #444; --faint: #666; --line: #ccc; --line-strong: #aaa; }
+      body { background: #fff; }
+      .theme-button, .controls { display: none; }
+      .panel, .summary-card { box-shadow: none; break-inside: avoid; }
+      .ranking, .fingerprints, pre { max-height: none; overflow: visible; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <div class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M3 14.5V10m4.7 4.5V5.5m4.6 9V8m4.7 6.5V3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          </span>
+          Schedlab / Result explorer
+        </div>
+        <button class="theme-button" id="theme-toggle" type="button">Light mode</button>
+      </div>
+      <div class="hero-grid">
+        <div>
+          <p class="eyebrow">Observed scheduling behavior</p>
+          <h1>Timing, tails,<br>and tradeoffs.</h1>
+          <p class="hero-copy">@@TITLE@@</p>
+        </div>
+        <div class="hero-meta">
+          <strong>Measurement context</strong>
+          <p>@@SYSTEM@@</p>
+          <span class="status status-@@STATUS_CLASS@@">@@STATUS@@</span>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="summary-grid" aria-label="Result summary">
+        <article class="summary-card"><span class="summary-label">Recorded runs</span><strong class="summary-value">@@RUNS@@</strong><span class="summary-detail">Every attempted workload</span></article>
+        <article class="summary-card"><span class="summary-label">Successful</span><strong class="summary-value">@@SUCCESSFUL@@</strong><span class="summary-detail">Validated native results</span></article>
+        <article class="summary-card"><span class="summary-label">Median run p99</span><strong class="summary-value">@@P99@@</strong><span class="summary-detail">Wall processing, not WCET</span></article>
+        <article class="summary-card"><span class="summary-label">Deadline misses</span><strong class="summary-value">@@MISSES@@</strong><span class="summary-detail">Periodic misses / samples</span></article>
+      </section>
+
+      <aside class="notice">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 6.5v4.25m0 2.75h.01M17.25 10A7.25 7.25 0 1 1 2.75 10a7.25 7.25 0 0 1 14.5 0Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <div><strong>Read these as observations, not guarantees.</strong> Synthetic audio misses are not hardware XRUNs; observed maxima are not worst-case execution times. Offline response and lateness accumulate from a shared release. Instrumentation and host interference remain part of every result.</div>
+      </aside>
+
+      <section class="controls panel" aria-label="Dashboard filters">
+        <div class="field"><label for="search">Find a run</label><input id="search" type="search" placeholder="Label, case, mode, policy…" autocomplete="off"></div>
+        <div class="field"><label for="status-filter">Status</label><select id="status-filter"><option value="all">All statuses</option><option value="ok">Successful</option><option value="skipped">Skipped</option><option value="error">Errors</option></select></div>
+        <div class="field"><label for="policy-filter">Policy</label><select id="policy-filter"><option value="all">All policies</option></select></div>
+        <div class="field"><label for="metric">Comparison metric</label><select id="metric">
+          <option value="wall_p99_ms">Wall processing p99</option><option value="wall_p50_ms">Wall processing median</option><option value="wall_max_ms">Wall processing maximum</option><option value="response_p99_ms">Response p99</option><option value="wake_p99_ms">Wake lateness p99</option><option value="cpu_p99_ms">Thread CPU p99</option><option value="throughput">Throughput</option><option value="miss_percent">Deadline miss rate</option><option value="tail_ratio">Tail amplification</option>
+        </select></div>
+        <div class="toggle-wrap"><label class="toggle"><input id="log-scale" type="checkbox"> Log scale</label></div>
+      </section>
+      <div class="view-status"><span id="visible-count">Loading dashboard…</span><span>Filters affect charts and the run table</span></div>
+      <noscript><div class="noscript">Interactive charts need JavaScript, but the complete result tables and manifest remain available below.</div></noscript>
+
+      <div class="charts">
+        <section class="panel chart-panel" aria-labelledby="ranking-title">
+          <div class="panel-heading"><div><span class="kicker">Comparison</span><h2 id="ranking-title">Run ranking</h2><p id="metric-description">Shared-scale comparison across visible runs.</p></div></div>
+          <div id="ranking" class="ranking" role="list" aria-live="polite"></div>
+        </section>
+        <section class="panel chart-panel" aria-labelledby="tail-title">
+          <div class="panel-heading">
+            <div><span class="kicker">Distribution shape</span><h2 id="tail-title">Latency fingerprint</h2><p>Wall processing p50 → p95 → p99 → observed max on one shared scale.</p></div>
+            <div class="chart-legend" aria-label="Percentile legend"><span class="legend-item"><i class="legend-dot"></i>p50</span><span class="legend-item"><i class="legend-dot p95"></i>p95</span><span class="legend-item"><i class="legend-dot p99"></i>p99</span><span class="legend-item"><i class="legend-dot max"></i>max</span></div>
+          </div>
+          <div id="fingerprints" class="fingerprints" aria-live="polite"></div>
+          <div id="tail-axis" class="axis" aria-hidden="true"></div>
+          <ul id="insights" class="insights" aria-label="Automatic observations"></ul>
+        </section>
+      </div>
+
+      <section class="panel section" aria-labelledby="runs-title">
+        <div class="panel-heading"><div><span class="kicker">Evidence</span><h2 id="runs-title">Individual runs</h2><p>Choose a run name to open its raw timestamp CSV. Sort any labeled column.</p></div></div>
+        <div class="table-scroll"><table id="run-table">
+          <thead><tr>
+            <th><button class="sort" data-sort="label">Run / raw CSV</button></th><th><button class="sort" data-sort="status">Status</button></th><th><button class="sort" data-sort="samples">Samples</button></th><th><button class="sort" data-sort="wall_p50_ms">Wall p50 ms</button></th><th><button class="sort" data-sort="wall_p99_ms">Wall p99 ms</button></th><th><button class="sort" data-sort="wall_max_ms">Wall max ms</button></th><th><button class="sort" data-sort="response_p99_ms">Response p99 ms</button></th><th><button class="sort" data-sort="wake_p99_ms">Wake p99 ms</button></th><th><button class="sort" data-sort="miss_percent">Misses</button></th><th><button class="sort" data-sort="throughput">Jobs/s</button></th><th><button class="sort" data-sort="policy">Effective scheduler / reason</button></th>
+          </tr></thead><tbody>@@ROWS@@</tbody>
+        </table></div>
+      </section>
+
+      <section class="panel section" aria-labelledby="repeat-title">
+        <div class="panel-heading"><div><span class="kicker">Stability</span><h2 id="repeat-title">Repetitions</h2><p>Runs are summarized independently; samples from separate repetitions are never pooled.</p></div></div>
+        <div class="table-scroll"><table><thead><tr><th>Case</th><th>Runs</th><th>Median run p99 ms</th><th>Run p99 range ms</th><th>Largest observation ms</th></tr></thead><tbody>@@REPEATS@@</tbody></table></div>
+      </section>
+
+      <section class="panel section" aria-labelledby="method-title">
+        <div class="panel-heading"><div><span class="kicker">Audit trail</span><h2 id="method-title">Method and provenance</h2></div></div>
+        <p class="method">The adjacent <code>run.json</code> is the machine-readable source. Check commands, effective policies, affinity, cgroup counters, thermal state, binary hash, compiler, kernel, skips, and raw artifacts before attributing a change to the scheduler.</p>
+        <details><summary>Open full manifest</summary><pre>@@MANIFEST@@</pre></details>
+      </section>
+    </main>
+    <footer class="footer"><span>Schedlab / self-contained offline report</span><span>No remote fonts, scripts, analytics, or network requests</span></footer>
+  </div>
+
+  <script>
+  "use strict";
+  const REPORT_DATA = @@REPORT_DATA@@;
+  const METRICS = {
+    wall_p99_ms: {label: "Wall processing p99", unit: "ms", detail: "99th-percentile time spent in the measured work section.", lower: true},
+    wall_p50_ms: {label: "Wall processing median", unit: "ms", detail: "Median time spent in the measured work section.", lower: true},
+    wall_max_ms: {label: "Wall processing maximum", unit: "ms", detail: "Largest observed processing time; this is not a WCET bound.", lower: true},
+    response_p99_ms: {label: "Response p99", unit: "ms", detail: "99th-percentile release-to-finish time.", lower: true},
+    wake_p99_ms: {label: "Wake lateness p99", unit: "ms", detail: "99th-percentile planned-release-to-start delay.", lower: true},
+    cpu_p99_ms: {label: "Thread CPU p99", unit: "ms", detail: "99th-percentile CPU time consumed by the measured thread.", lower: true},
+    throughput: {label: "Throughput", unit: "jobs/s", detail: "Jobs completed inside the measurement window per second.", lower: false},
+    miss_percent: {label: "Deadline miss rate", unit: "%", detail: "Periodic response observations beyond their relative deadline.", lower: true},
+    tail_ratio: {label: "Tail amplification", unit: "×", detail: "Wall-processing p99 divided by the median; closer to 1 is tighter.", lower: true}
+  };
+  const elements = {
+    search: document.querySelector("#search"), status: document.querySelector("#status-filter"),
+    policy: document.querySelector("#policy-filter"), metric: document.querySelector("#metric"),
+    log: document.querySelector("#log-scale"), ranking: document.querySelector("#ranking"),
+    fingerprints: document.querySelector("#fingerprints"), axis: document.querySelector("#tail-axis"),
+    count: document.querySelector("#visible-count"), description: document.querySelector("#metric-description"),
+    insights: document.querySelector("#insights"), tableBody: document.querySelector("#run-table tbody")
+  };
+  const state = {sort: null, direction: "asc"};
+
+  function node(tag, className, text) {
+    const result = document.createElement(tag);
+    if (className) result.className = className;
+    if (text !== undefined) result.textContent = text;
+    return result;
+  }
+  function finite(value) { return typeof value === "number" && Number.isFinite(value); }
+  function format(value, metricKey) {
+    if (!finite(value)) return "n/a";
+    const metric = METRICS[metricKey];
+    const digits = Math.abs(value) >= 100 ? 1 : Math.abs(value) >= 10 ? 2 : 3;
+    return value.toLocaleString(undefined, {maximumFractionDigits: digits}) + " " + metric.unit;
+  }
+  function filteredRuns() {
+    const query = elements.search.value.trim().toLocaleLowerCase();
+    return REPORT_DATA.runs.filter(run => {
+      const haystack = [run.label, run.case, run.mode, run.policy].join(" ").toLocaleLowerCase();
+      return (!query || haystack.includes(query)) &&
+        (elements.status.value === "all" || run.status === elements.status.value) &&
+        (elements.policy.value === "all" || run.policy === elements.policy.value);
+    });
+  }
+  function scale(value, maximum) {
+    if (!finite(value) || maximum <= 0) return 0;
+    return elements.log.checked ? Math.log10(value + 1) / Math.log10(maximum + 1) : value / maximum;
+  }
+  function empty(container, message) {
+    const box = node("div", "empty", message);
+    container.replaceChildren(box);
+  }
+  function renderRanking(runs) {
+    const key = elements.metric.value;
+    const metadata = METRICS[key];
+    elements.description.textContent = metadata.detail + (elements.log.checked ? " Logarithmic scale." : " Linear shared scale.");
+    const ranked = runs.filter(run => finite(run[key])).sort((a, b) => metadata.lower ? a[key]-b[key] : b[key]-a[key]);
+    if (!ranked.length) { empty(elements.ranking, "No visible run has this metric."); return; }
+    const maximum = Math.max(...ranked.map(run => run[key]), Number.EPSILON);
+    elements.ranking.replaceChildren(...ranked.map(run => {
+      const row = node("div", "rank-row");
+      row.setAttribute("role", "listitem");
+      row.setAttribute("aria-label", run.label + ": " + format(run[key], key));
+      const name = node("span", "run-name", run.label); name.title = run.label;
+      const track = node("span", "bar-track");
+      const bar = node("span", "bar"); bar.style.width = Math.max(0.35, scale(run[key], maximum)*100) + "%";
+      track.append(bar);
+      row.append(name, track, node("span", "rank-value", format(run[key], key)));
+      return row;
+    }));
+  }
+  function renderFingerprints(runs) {
+    const measured = runs.filter(run => [run.wall_p50_ms, run.wall_p95_ms, run.wall_p99_ms, run.wall_max_ms].every(finite));
+    if (!measured.length) {
+      empty(elements.fingerprints, "No latency distributions in the current view.");
+      elements.axis.replaceChildren();
+      return;
+    }
+    const maximum = Math.max(...measured.map(run => run.wall_max_ms), Number.EPSILON);
+    const position = value => scale(value, maximum)*100;
+    elements.fingerprints.replaceChildren(...measured.map(run => {
+      const row = node("div", "fingerprint-row");
+      row.setAttribute("aria-label", run.label + ", p50 " + format(run.wall_p50_ms, "wall_p50_ms") +
+        ", p99 " + format(run.wall_p99_ms, "wall_p99_ms") + ", max " + format(run.wall_max_ms, "wall_max_ms"));
+      const name = node("span", "run-name", run.label); name.title = run.label;
+      const track = node("span", "fingerprint-track");
+      const p50 = position(run.wall_p50_ms), max = position(run.wall_max_ms);
+      const line = node("span", "fingerprint-line"); line.style.left = p50 + "%"; line.style.width = Math.max(0, max-p50) + "%";
+      track.append(line);
+      [["", run.wall_p50_ms], ["p95", run.wall_p95_ms], ["p99", run.wall_p99_ms], ["max", run.wall_max_ms]].forEach(([kind, value]) => {
+        const dot = node("span", "fingerprint-dot " + kind); dot.style.left = position(value) + "%"; dot.title = (kind || "p50") + ": " + format(value, "wall_p99_ms"); track.append(dot);
+      });
+      row.append(name, track); return row;
+    }));
+    elements.axis.replaceChildren(node("span", "", "0"), node("span", "", (elements.log.checked ? "log · " : "") + format(maximum, "wall_max_ms")));
+  }
+  function insight(number, title, detail) {
+    const item = node("li"); const body = node("span");
+    const strong = node("strong", "", title); body.append(strong, document.createTextNode(" " + detail));
+    item.append(node("span", "insight-number", number), body); return item;
+  }
+  function renderInsights(runs) {
+    const measured = runs.filter(run => finite(run.wall_p99_ms));
+    const items = [];
+    if (measured.length) {
+      const fastest = measured.reduce((best, run) => run.wall_p99_ms < best.wall_p99_ms ? run : best);
+      items.push(insight("01", "Lowest wall p99:", fastest.label + " at " + format(fastest.wall_p99_ms, "wall_p99_ms") + "."));
+    }
+    const tailed = runs.filter(run => finite(run.tail_ratio));
+    if (tailed.length) {
+      const widest = tailed.reduce((worst, run) => run.tail_ratio > worst.tail_ratio ? run : worst);
+      items.push(insight("02", "Widest p99/median gap:", widest.label + " at " + format(widest.tail_ratio, "tail_ratio") + "."));
+    }
+    const periodic = runs.filter(run => finite(run.miss_percent));
+    if (periodic.length) {
+      const misses = periodic.reduce((sum, run) => sum + (run.deadline_misses || 0), 0);
+      items.push(insight("03", "Periodic deadline misses:", misses + " across " + periodic.length + " visible run" + (periodic.length === 1 ? "" : "s") + "."));
+    }
+    elements.insights.replaceChildren(...items);
+  }
+  function applyTableFilter(runs) {
+    const visible = new Set(runs.map(run => run.index));
+    elements.tableBody.querySelectorAll("tr[data-run-index]").forEach(row => { row.hidden = !visible.has(Number(row.dataset.runIndex)); });
+  }
+  function compareValues(left, right, key) {
+    const a = left[key], b = right[key];
+    if (a === b) return 0;
+    if (a === null || a === undefined) return 1;
+    if (b === null || b === undefined) return -1;
+    return typeof a === "string" ? a.localeCompare(b) : a-b;
+  }
+  function sortTable(key) {
+    if (state.sort === key) state.direction = state.direction === "asc" ? "desc" : "asc";
+    else { state.sort = key; state.direction = "asc"; }
+    const factor = state.direction === "asc" ? 1 : -1;
+    const byIndex = new Map(REPORT_DATA.runs.map(run => [run.index, run]));
+    [...elements.tableBody.querySelectorAll("tr[data-run-index]")]
+      .sort((a, b) => factor*compareValues(byIndex.get(Number(a.dataset.runIndex)), byIndex.get(Number(b.dataset.runIndex)), key))
+      .forEach(row => elements.tableBody.append(row));
+    document.querySelectorAll(".sort").forEach(button => button.dataset.active = button.dataset.sort === key ? state.direction : "");
+  }
+  function render() {
+    const runs = filteredRuns();
+    elements.count.textContent = runs.length + " of " + REPORT_DATA.runs.length + " runs visible";
+    renderRanking(runs); renderFingerprints(runs); renderInsights(runs); applyTableFilter(runs);
+  }
+  [...new Set(REPORT_DATA.runs.map(run => run.policy).filter(Boolean))].sort().forEach(policy => {
+    const option = node("option", "", policy); option.value = policy; elements.policy.append(option);
+  });
+  [elements.search, elements.status, elements.policy, elements.metric, elements.log].forEach(control => control.addEventListener("input", render));
+  document.querySelectorAll(".sort").forEach(button => button.addEventListener("click", () => sortTable(button.dataset.sort)));
+  document.querySelector("#theme-toggle").addEventListener("click", event => {
+    const light = document.documentElement.dataset.theme === "light";
+    document.documentElement.dataset.theme = light ? "dark" : "light";
+    event.currentTarget.textContent = light ? "Light mode" : "Dark mode";
+  });
+  sortTable("label");
+  render();
+  </script>
+</body>
+</html>

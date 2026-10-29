@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <iostream>
 #include <memory>
 #include <sched.h>
 #include <span>
@@ -67,22 +68,25 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const std::string_view name(argv[i]);
         if (name == "--help") {
-            std::puts("thread-pipeline --output FILE.wav [--buffers 1..100] [--consumer-delay-ms 0..50]\n"
-                      "Ordinary-priority C++20 SPSC example; NOT an RT/device measurement.");
-            return 0;
+            std::cout << "thread-pipeline --output FILE.wav [--buffers 1..100] "
+                         "[--consumer-delay-ms 0..50]\n"
+                         "Ordinary-priority C++20 SPSC example; NOT an RT/device measurement.\n"
+                      << std::flush;
+            return std::cout ? 0 : 1;
         }
-        if (i+1 == argc) { std::fputs("missing option value\n",stderr); return 2; }
+        if (i+1 == argc) { std::cerr << "missing option value\n"; return 2; }
         const char *value = argv[++i];
         if (name == "--output") output = value;
         else if (name == "--buffers" && parse_number(value,buffers,1,100)) {}
         else if (name == "--consumer-delay-ms" && parse_number(value,consumer_delay_ms,0,50)) {}
-        else { std::fputs("invalid option or bounded value\n",stderr); return 2; }
+        else { std::cerr << "invalid option or bounded value\n"; return 2; }
     }
-    if (!output) { std::fputs("--output is required\n",stderr); return 2; }
+    if (!output) { std::cerr << "--output is required\n"; return 2; }
     const int policy = static_cast<int>(syscall(SYS_sched_getscheduler,0));
     if (policy < 0) { std::perror("inspect scheduler"); return 1; }
     if (policy != SCHED_OTHER) {
-        std::fputs("this example must start with SCHED_OTHER; use sched-work for guarded RT experiments\n",stderr);
+        std::cerr << "this example must start with SCHED_OTHER; "
+                     "use sched-work for guarded RT experiments\n";
         return 2;
     }
     try {
@@ -129,13 +133,19 @@ int main(int argc, char **argv) {
         producer.join();
         consumer.join();  // Explicit drain before scope-exit requests cancellation.
         if (!lab::write_wav(output,recording)) { std::perror("write WAV"); return 1; }
-        std::printf("{\"status\":\"ok\",\"policy\":\"other\",\"buffers\":%d,"
-                    "\"consumed\":%zu,\"dropped\":%zu,\"queue_capacity\":8,"
-                    "\"consumer_delay_ms\":%d,\"device_xruns_measured\":false}\n",
-                    buffers,consumed,dropped,consumer_delay_ms);
+        std::cout << "{\"status\":\"ok\",\"policy\":\"other\",\"buffers\":" << buffers
+                  << ",\"consumed\":" << consumed << ",\"dropped\":" << dropped
+                  << ",\"queue_capacity\":8,\"consumer_delay_ms\":" << consumer_delay_ms
+                  << ",\"device_xruns_measured\":false}\n" << std::flush;
+        if (!std::cout) {
+            std::cerr << "write standard output failed\n";
+            return 1;
+        }
     } catch (const std::system_error &error) {
-        std::fprintf(stderr,"thread setup/join failed: %s\n",error.what()); return 1;
+        std::cerr << "thread setup/join failed: " << error.what() << '\n';
+        return 1;
     } catch (const std::bad_alloc &error) {
-        std::fprintf(stderr,"buffer preallocation failed: %s\n",error.what()); return 1;
+        std::cerr << "buffer preallocation failed: " << error.what() << '\n';
+        return 1;
     }
 }

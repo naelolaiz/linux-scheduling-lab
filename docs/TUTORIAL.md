@@ -17,7 +17,7 @@ shutdown, priority selection and a runnable producer/consumer example.
 
 ## 1. Five-minute safe quickstart
 
-Requirements: GCC 11+ or Clang 14+ with a matching C++20 library including
+Requirements: GCC 11+ or Clang 18+ with a matching C++20 library including
 `std::binary_semaphore`, CMake 3.21+ (its default generator uses GNU Make; Ninja
 also works) and Python 3.10+. A glibc or musl Linux
 installation is supported. Linux 5.4+ is the baseline; optional interfaces depend

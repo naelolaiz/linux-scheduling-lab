@@ -185,11 +185,11 @@ int default_threads(LoadKind kind, std::size_t cpus) {
     }
 }
 
-// Sorted, without repeats. std::unique rather than std::ranges::unique: Clang 14 cannot use the
-// subrange that libstdc++ 11 returns.
+// Sorted, without repeats.
 std::vector<int> distinct_cpus(std::vector<int> cpus) {
     std::ranges::sort(cpus);
-    cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end()); // NOLINT(modernize-use-ranges)
+    const auto repeats = std::ranges::unique(cpus);
+    cpus.erase(repeats.begin(), repeats.end());
     return cpus;
 }
 

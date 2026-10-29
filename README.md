@@ -109,7 +109,7 @@ and [DEADLINE admission/bandwidth rules](https://docs.kernel.org/scheduler/sched
 The lab's [watchdog and opt-in checks](native/work.cpp) are additional safeguards,
 not kernel latency guarantees.
 
-**Requirements:** Linux, CMake 3.21+ (with GNU Make or Ninja), GCC 11+ or Clang 14+
+**Requirements:** Linux, CMake 3.21+ (with GNU Make or Ninja), GCC 11+ or Clang 18+
 with a C++20 standard library (including semaphores), Python 3.10+. Optional: uv
 for the `poe` tasks. The baseline targets Linux 5.4+;
 optional features are detected rather than assumed. glibc and musl are covered

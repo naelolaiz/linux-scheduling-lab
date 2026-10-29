@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 
+from .analysis import analyze, analyze_manifest, load_manifest, render, render_findings_text
 from .environment import capture
 from .report import compare, write_report
 from .runner import BINARY, PRESETS, run
@@ -39,6 +40,12 @@ def main(argv=None):
     comparison = commands.add_parser("compare", help="compare saved runs across boots or machines")
     comparison.add_argument("runs", type=Path, nargs="+")
     comparison.add_argument("--out", type=Path, required=True)
+    analyzer = commands.add_parser(
+        "analyze", help="summarize saved runs: per-case table and plot, findings, caveats, comparison"
+    )
+    analyzer.add_argument("runs", type=Path, nargs="+", help="run directories or run.json manifests")
+    analyzer.add_argument("--format", choices=("text", "markdown", "json"), default="text")
+    analyzer.add_argument("--out", type=Path, help="write here instead of stdout")
     replay = commands.add_parser(
         "replay", help="repeat a saved preset; never execute commands from a manifest"
     )
@@ -60,14 +67,19 @@ def main(argv=None):
                 print(text, end="")
             return 0
         if args.command == "report":
-            manifest = json.loads(args.manifest.read_text())
-            if manifest.get("schema_version") != 1:
-                raise ValueError("unsupported manifest schema")
+            _, manifest = load_manifest(args.manifest)
             write_report(manifest, args.out)
             print(args.out)
             return 0
         if args.command == "compare":
             print(compare(args.runs, args.out) / "report.html")
+            return 0
+        if args.command == "analyze":
+            text = render(analyze(args.runs), args.format)
+            if args.out:
+                args.out.write_text(text)
+            else:
+                print(text, end="")
             return 0
         if args.command == "replay":
             source = json.loads(args.manifest.read_text())
@@ -96,6 +108,10 @@ def main(argv=None):
         for result in manifest["runs"]:
             if result["status"] != "ok":
                 print(f"{result['label']}: {result['status']}: {result['reason']}")
+        try:
+            print(render_findings_text(analyze_manifest(manifest, output / "run.json")), end="")
+        except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+            print(f"analysis unavailable: {exc}", file=sys.stderr)
         return 1 if states["error"] else 0
     except (OSError, ValueError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)

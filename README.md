@@ -20,6 +20,7 @@ the quickstart. Gentoo/OpenRC is a first-class setup.
 ```sh
 uv run poe test      # CMake build in build/default, then the unprivileged test suite
 uv run poe lab run quick --repetitions 1 --out results/first
+uv run poe analyze results/first   # per-case table and plot, findings, caveats
 # Open results/first/report.html in a browser; no server or internet needed.
 ```
 
@@ -32,6 +33,7 @@ Without uv, the same quickstart is:
 cmake --preset default && cmake --build --preset default
 python3 -m unittest discover -s tests -v
 python3 -m schedlab run quick --repetitions 1 --out results/first
+python3 -m schedlab analyze results/first
 ```
 
 Other presets build side by side in `build/<preset>`: `SCHEDLAB_PRESET=clang uv run poe test`,
@@ -70,6 +72,15 @@ latency or throughput metric, compares percentile tails, and needs no server.
 `replay` and `compare` support experiments across kernel boots and machines.
 Existing output directories are never overwritten by `run`.
 
+[`schedlab analyze`](schedlab/analysis.py) reads saved runs and prints a per-case
+table with a bar plot, preset-aware findings (for example, measured CPU share
+against the kernel's load-weight model in `fairness`, or priority inversion in
+`locks`) and caveats such as too few repetitions or a sanitized build; with
+several runs it compares the same cases and names what differs between them.
+`--format markdown` and `--format json` serve other tools. `run` prints the
+findings when it finishes, and `report.html` shows them too. Every CI run's
+summary page carries this analysis for its example runs across the build matrix.
+
 Measurement sources: [monotonic and thread-CPU clocks](https://man7.org/linux/man-pages/man2/clock_gettime.2.html),
 [resource/fault counters](https://man7.org/linux/man-pages/man2/getrusage.2.html),
 and the lab's [metric definitions](schedlab/metrics.py) and
@@ -103,4 +114,5 @@ and [OpenRC documentation](https://wiki.gentoo.org/wiki/OpenRC).
 This is an educational measurement tool, **not an RT certification suite**.
 Observed maxima are not WCET bounds; synthetic audio misses are not
 [device XRUNs](https://www.alsa-project.org/alsa-doc/alsa-lib/pcm.html).
-CI checks correctness and portability, never universal performance rankings.
+CI checks correctness and portability, never universal performance rankings; the
+analyses on its summary pages are examples from shared runners.

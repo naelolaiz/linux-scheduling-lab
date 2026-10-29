@@ -78,10 +78,19 @@ python3 -m schedlab run quick --repetitions 1 --out results/first
 
 With uv, `uv run poe test` performs the first two steps.
 
+When the run finishes it prints its findings and caveats. For the full summary
+in the terminal, run `python3 -m schedlab analyze results/first` (or
+`uv run poe analyze results/first`): one row per case with the median of its
+primary metric (response p99 for periodic work, throughput for offline work,
+high-priority wait for locks), the range across repetitions and a bar plot, then
+the preset's findings and caveats. Give it several run directories to compare the
+same cases across boots, compilers or machines; `--format markdown` and
+`--format json` produce the same analysis for other tools.
+
 Open `results/first/report.html` directly in a browser. Its interactive dashboard
-has run/status/policy filters, selectable metric rankings, latency-tail plots,
-sortable evidence tables, and dark/light themes. It needs no web server or remote
-assets. The directory also contains:
+shows the same findings, plus run/status/policy filters, selectable metric
+rankings, latency-tail plots, sortable evidence tables, and dark/light themes. It
+needs no web server or remote assets. The directory also contains:
 
 | File | Meaning |
 |---|---|
@@ -215,7 +224,10 @@ OTHER/0, OTHER/10, BATCH/0 or IDLE/0. Three repetitions are the default.
 switches, starvation and effective nice/policy. A quiet CPU may make policies look
 similar. BATCH is not a promise of better throughput; IDLE progress may be tiny.
 Nice differences within the same fair group often change the share substantially,
-but do not assert an exact ratio from a short experiment.
+but do not assert an exact ratio from a short experiment. `schedlab analyze`
+reports each candidate's measured share of the pair's CPU time beside the share
+predicted by the kernel's load weights (`sched_prio_to_weight`: 1024 at nice 0,
+110 at nice 10, 3 for IDLE), so you can see how close a short window comes.
 
 **Pros/cons:** these policies are useful for background renders/builds because they
 usually need no special permission when lowering importance. They cannot reserve
@@ -513,6 +525,7 @@ The `uv run poe …` forms are optional shortcuts for the plain commands beside 
 | `python3 -m schedlab report RUN.json --out FILE.html` | Rebuild a report from saved results |
 | `python3 -m schedlab replay RUN.json --out DIR` | Rerun a validated preset with current code; renew privileged opt-ins |
 | `python3 -m schedlab compare DIR1 DIR2 --out DIR3` | Compare manifests from directories or `run.json` paths |
+| `python3 -m schedlab analyze DIR... [--format text\|markdown\|json] [--out FILE]`, `uv run poe analyze DIR...` | Per-case table and bar plot, preset findings, caveats; several runs add a same-case comparison |
 | `./build/default/sched-work --help` | Full native option list and bounds |
 | `./build/default/sched-work --build-info` | Compiler, flags, sanitizers and C/C++ libraries of this binary |
 | `./build/default/thread-pipeline --help` | Ordinary-priority C++20 bounded-queue/ownership example |

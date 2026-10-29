@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 import wave
 
+from schedlab.analysis import analyze, analyze_manifest, bar, compare_analyses, render
 from schedlab.cgroups import Unavailable, cpu_groups
 from schedlab.environment import capture, kernel_config, native_build, read
 from schedlab.metrics import distribution, quantile, summarize
@@ -287,10 +288,26 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("&lt;script&gt;", escaped)
             self.assertNotIn("<script>alert(1)</script>", escaped)
             self.assertNotIn("href='javascript:", escaped)
+            self.assertIn('id="findings-title"', text)
+            self.assertIn("of jobs finished before the next release", text)
             compare([output, output / "run.json"], root / "comparison")
             combined = json.loads((root / "comparison/run.json").read_text())
             self.assertEqual(len(combined["runs"]), 6)
             self.assertTrue(combined["runs"][0]["artifact_prefix"].startswith("file:"))
+            result = analyze([output, output / "run.json"])
+            self.assertEqual(
+                [row["case"] for row in result["comparison"]["tables"][0]["rows"]],
+                ["offline", "audio", "video"],
+            )
+            self.assertIn("Comparison across runs", render(result, "text"))
+            self.assertIn("<details>", render(result, "markdown"))
+            self.assertEqual(json.loads(render(result, "json"))["schema_version"], 1)
+            from schedlab.__main__ import main
+
+            self.assertEqual(
+                main(["analyze", str(output), "--out", str(root / "analysis.md"), "--format", "markdown"]), 0
+            )
+            self.assertIn("| audio |", (root / "analysis.md").read_text())
             with self.assertRaises(FileExistsError):
                 run("quick", output, repetitions=1)
 
@@ -388,6 +405,117 @@ class HarnessTests(unittest.TestCase):
             manifest = run("cgroup", Path(directory) / "run", repetitions=1, parent=parent)
             self.assertEqual([r["status"] for r in manifest["runs"]], ["ok"] * 4)
         self.assertEqual(set(parent.iterdir()), before)
+
+
+def synthetic_run(case, repetition=1, policy="other", nice=0, mode="offline", core=None, **metrics):
+    effective = {"policy": policy, "nice": nice, "rr_quantum_ns": 100_000_000}
+    return {
+        "case": case,
+        "label": f"{case}-r{repetition}",
+        "repetition": repetition,
+        "status": "ok",
+        "core": {"mode": mode, "effective": effective, **(core or {})},
+        "metrics": metrics,
+    }
+
+
+class AnalysisTests(unittest.TestCase):
+    def test_fairness_share_against_load_weights(self):
+        manifest = {
+            "schema_version": 1,
+            "preset": "fairness",
+            "repetitions": 1,
+            "runs": [
+                synthetic_run("fair-other-10-control", cpu_total_ns=900, throughput_jobs_s=90),
+                synthetic_run("fair-other-10-candidate", nice=10, cpu_total_ns=100, throughput_jobs_s=10),
+                synthetic_run("fair-idle-0-control", cpu_total_ns=995),
+                synthetic_run("fair-idle-0-candidate", policy="idle", cpu_total_ns=5),
+            ],
+        }
+        analysis = analyze_manifest(manifest)
+        shares = {f["data"]["case"]: f["data"] for f in analysis["findings"] if "case" in f["data"]}
+        self.assertAlmostEqual(shares["fair-other-10-candidate"]["measured_share"], 0.1)
+        self.assertAlmostEqual(shares["fair-other-10-candidate"]["model_share"], 110 / (110 + 1024))
+        self.assertAlmostEqual(shares["fair-idle-0-candidate"]["model_share"], 3 / (3 + 1024))
+        self.assertTrue(any("1 repetition" in caveat for caveat in analysis["caveats"]))
+        self.assertEqual(analysis["cases"][0]["metric"]["key"], "throughput_jobs_s")
+
+    def test_priority_inversion_and_sharing_order(self):
+        def lock(low, medium):
+            return {"lock": {"low_finish_ns": low, "medium_finish_ns": medium, "high_wait_ns": 4_000_000}}
+
+        locks = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "locks",
+                "runs": [
+                    synthetic_run("lock-none", mode="lock", core=lock(200, 100)),
+                    synthetic_run("lock-inherit", mode="lock", core=lock(100, 200)),
+                ],
+            }
+        )
+        self.assertEqual([f["data"]["inverted"] for f in locks["findings"]], [1, 0])
+        sharing = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "sharing",
+                "runs": [
+                    synthetic_run("sharing-fifo-0", first_start_ns=0, last_finish_ns=10_000_000),
+                    synthetic_run("sharing-fifo-1", first_start_ns=10_500_000, last_finish_ns=20_000_000),
+                    synthetic_run("sharing-rr-0", first_start_ns=0, last_finish_ns=19_000_000),
+                    synthetic_run("sharing-rr-1", first_start_ns=1_000_000, last_finish_ns=20_000_000),
+                ],
+            }
+        )
+        overlap = {f["data"]["policy"]: f["data"]["overlap_ms"] for f in sharing["findings"]}
+        self.assertLess(overlap["fifo"], 0)
+        self.assertAlmostEqual(overlap["rr"], 18.0)
+
+    def test_cgroup_weight_and_quota(self):
+        def group(case, control, **metrics):
+            run = synthetic_run(case, **metrics)
+            run["cgroup"] = {"requested": control}
+            return run
+
+        analysis = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "cgroup",
+                "runs": [
+                    group("cgroup-weight-0", {"cpu.weight": "100"}, cpu_total_ns=200),
+                    group("cgroup-weight-1", {"cpu.weight": "400"}, cpu_total_ns=800),
+                    group("cgroup-quota-1", {"cpu.max": "20000 100000"}, cpu_total_ns=19, elapsed_ns=100),
+                ],
+            }
+        )
+        weight, quota = analysis["findings"]
+        self.assertAlmostEqual(weight["data"]["measured_share"], 0.8)
+        self.assertAlmostEqual(weight["data"]["model_share"], 0.8)
+        self.assertAlmostEqual(quota["data"]["used"], 0.19)
+
+    def test_caveats_rendering_and_differences(self):
+        build = {
+            "compiler_id": "GNU",
+            "compiler_version": "13",
+            "build_type": "RelWithDebInfo",
+            "sanitize": "thread",
+        }
+        manifest = {
+            "schema_version": 1,
+            "preset": "quick",
+            "repetitions": 3,
+            "environment": {"native_build": build},
+            "runs": [synthetic_run("a|b", mode="audio", response_ns={"p99": 2e6}, miss_fraction=0.5)],
+        }
+        first = analyze_manifest(manifest, "one")
+        self.assertTrue(any("not measurements" in caveat for caveat in first["caveats"]))
+        markdown = render({"schema_version": 1, "runs": [first], "comparison": None}, "markdown")
+        self.assertIn("a\\|b", markdown)
+        second = dict(first, build="Clang 18 RelWithDebInfo")
+        self.assertIn("native build", compare_analyses([first, second])["differences"])
+        self.assertEqual(bar(5, 10, width=4), "██")
+        self.assertEqual(bar(1, 80, width=1), "▏")
+        self.assertEqual(bar(None, 10), "")
 
 
 class EnvironmentTests(unittest.TestCase):

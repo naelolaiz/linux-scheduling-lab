@@ -7,6 +7,8 @@ import re
 import statistics
 from urllib.parse import urlsplit
 
+from .analysis import analyze_manifest, build_summary, findings_html, load_manifest
+
 TEMPLATE = Path(__file__).with_name("report_template.html")
 
 
@@ -187,17 +189,13 @@ def _render(template, values):
     return pattern.sub(lambda match: values[match.group(1)], template)
 
 
-def build_summary(build):
-    """One line naming the compiler, build type and any sanitizers of a native build."""
-    if not isinstance(build, dict) or build.get("status") == "unavailable":
-        return "unknown native build"
-    compiler = (
-        f"{build.get('compiler_id', 'compiler')} {build.get('compiler_version', build.get('compiler', ''))}"
-    )
-    parts = [compiler.strip(), build.get("build_type") or "no build type"]
-    if build.get("sanitize"):
-        parts.append(f"sanitize={build['sanitize']}")
-    return " ".join(parts)
+def _findings(manifest):
+    # A report is written even for interrupted or malformed runs; never let analysis prevent it.
+    try:
+        return findings_html(analyze_manifest(manifest))
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+        reason = html.escape(f"analysis unavailable: {exc}")
+        return f"<li class='caveat'><span class='insight-number'>!</span><div>{reason}</div></li>"
 
 
 def write_report(manifest, path):
@@ -221,6 +219,7 @@ def write_report(manifest, path):
         "SYSTEM": html.escape(f"{architecture} · Linux {kernel} · {host} · {build}"),
         "ROWS": _run_rows(views),
         "REPEATS": _repeat_rows(views),
+        "FINDINGS": _findings(manifest),
         "MANIFEST": html.escape(json.dumps(manifest, indent=2, sort_keys=True)),
         "REPORT_DATA": _script_json({"title": title, "status": status, "runs": views}),
         **summary,
@@ -241,12 +240,7 @@ def compare(paths, output):
         ),
     }
     for index, path in enumerate(paths):
-        source = Path(path)
-        if source.is_dir():
-            source = source / "run.json"
-        manifest = json.loads(source.read_text())
-        if manifest.get("schema_version") != 1:
-            raise ValueError(f"unsupported manifest schema: {source}")
+        source, manifest = load_manifest(path)
         combined["sources"].append({"path": str(source.resolve()), "manifest": manifest})
         for original in manifest["runs"]:
             run = dict(original)

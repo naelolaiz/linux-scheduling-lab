@@ -25,6 +25,8 @@ select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "PIE", "RUF"]
 ignore = [
     "C408",   # dict(key=...) reads well for scheduler case specifications
 ]
+# Typographic characters that reports and analyses print on purpose.
+allowed-confusables = ["–", "×"]
 
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
@@ -50,6 +52,10 @@ sequence = ["build", { cmd = "python -m unittest discover -s tests -v" }]
 [tool.poe.tasks.lab]
 help = "Run the schedlab CLI against that build, e.g. `poe lab run quick`"
 cmd = "python -m schedlab"
+
+[tool.poe.tasks.analyze]
+help = "Summarize saved runs: tables, plots, findings, caveats (--format text|markdown|json)"
+cmd = "python -m schedlab analyze"
 
 # Linters run through `uv run --group lint`, so `uv run poe lint` needs no extra flags.
 [tool.poe.tasks.format]

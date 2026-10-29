@@ -29,13 +29,47 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: C++20 build and bounded unprivileged tests (native architecture)
         run: uv run --locked poe test
-      - name: Produce example report (not a performance gate)
-        run: uv run --locked poe lab run quick --repetitions 1 --out results/ci
+      - name: Example experiments (not a performance gate)
+        run: |
+          for preset in quick fairness audio; do
+            uv run --locked poe lab run "$preset" --repetitions 3 --out "results/ci/$preset" \
+              --label "${{ matrix.os }} · ${{ matrix.preset }} · $preset"
+          done
+      - name: Analysis
+        run: uv run --locked poe analyze results/ci/*/
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: results-${{ matrix.os }}-${{ matrix.preset }}
           path: results/ci/
+          retention-days: 7
+
+  results:
+    needs: linux
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: results-*
+          path: results
+      - name: Analysis across machines in the job summary (examples, not rankings; no uv)
+        run: |
+          shopt -s nullglob
+          manifests=(results/*/*/run.json)
+          if [ ${#manifests[@]} -eq 0 ]; then
+            echo "No result manifests were uploaded." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 -m schedlab analyze "${manifests[@]}" --format markdown >> "$GITHUB_STEP_SUMMARY"
+          python3 -m schedlab analyze "${manifests[@]}" --format json --out analysis.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: analysis
+          path: analysis.json
+          if-no-files-found: ignore
           retention-days: 7
 
   sanitizers:

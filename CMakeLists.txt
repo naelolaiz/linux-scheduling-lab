@@ -29,8 +29,9 @@ endif()
 configure_file(native/build_config.hpp.in generated/build_config.hpp @ONLY)
 
 add_executable(sched-work native/work.cpp)
+add_executable(sched-load native/load.cpp)
 add_executable(thread-pipeline native/pipeline.cpp)
-foreach(program IN ITEMS sched-work thread-pipeline)
+foreach(program IN ITEMS sched-work sched-load thread-pipeline)
   target_compile_options(${program} PRIVATE -Wall -Wextra -Wpedantic
                          $<$<BOOL:${SCHEDLAB_WERROR}>:-Werror>)
   target_link_libraries(${program} PRIVATE Threads::Threads m)

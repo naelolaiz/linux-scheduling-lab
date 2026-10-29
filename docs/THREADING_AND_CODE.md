@@ -34,10 +34,10 @@ promises about this lab's compiler/library combinations.
 ## 2. Runnable C++20 pipeline
 
 ```sh
-make
+cmake --preset default && cmake --build --preset default
 mkdir -p results/threading
-./build/thread-pipeline --output results/threading/normal.wav
-./build/thread-pipeline --consumer-delay-ms 50 --output results/threading/slow.wav
+./build/default/thread-pipeline --output results/threading/normal.wav
+./build/default/thread-pipeline --consumer-delay-ms 50 --output results/threading/slow.wav
 ```
 
 Read [`native/pipeline.cpp`](../native/pipeline.cpp) alongside the output. Both

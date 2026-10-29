@@ -4,9 +4,10 @@ import json
 from pathlib import Path
 import sys
 
+from .analysis import analyze, analyze_manifest, load_manifest, render, render_findings_text
 from .environment import capture
 from .report import compare, write_report
-from .runner import PRESETS, run
+from .runner import BINARY, PRESETS, run
 
 
 def bounded_repetitions(value):
@@ -17,7 +18,9 @@ def bounded_repetitions(value):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Measured Linux scheduling labs; no automatic privilege escalation.")
+    parser = argparse.ArgumentParser(
+        description="Measured Linux scheduling labs; no automatic privilege escalation."
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     doctor = commands.add_parser("doctor", help="read-only kernel, CPU, cgroup and permission inventory")
     doctor.add_argument("--out", type=Path, help="write JSON here instead of stdout")
@@ -26,7 +29,9 @@ def main(argv=None):
     experiment.add_argument("--out", type=Path)
     experiment.add_argument("--repetitions", type=bounded_repetitions, default=3)
     experiment.add_argument("--cpu", type=int)
-    experiment.add_argument("--allow-rt", action="store_true", help="explicitly opt in; native safety checks still apply")
+    experiment.add_argument(
+        "--allow-rt", action="store_true", help="explicitly opt in; native safety checks still apply"
+    )
     experiment.add_argument("--cgroup-parent", type=Path)
     experiment.add_argument("--label", help="experiment label, e.g. kernel boot and hardware description")
     report = commands.add_parser("report", help="regenerate HTML from an existing run manifest")
@@ -35,31 +40,46 @@ def main(argv=None):
     comparison = commands.add_parser("compare", help="compare saved runs across boots or machines")
     comparison.add_argument("runs", type=Path, nargs="+")
     comparison.add_argument("--out", type=Path, required=True)
-    replay = commands.add_parser("replay", help="repeat a saved preset; never execute commands from a manifest")
+    analyzer = commands.add_parser(
+        "analyze", help="summarize saved runs: per-case table and plot, findings, caveats, comparison"
+    )
+    analyzer.add_argument("runs", type=Path, nargs="+", help="run directories or run.json manifests")
+    analyzer.add_argument("--format", choices=("text", "markdown", "json"), default="text")
+    analyzer.add_argument("--out", type=Path, help="write here instead of stdout")
+    replay = commands.add_parser(
+        "replay", help="repeat a saved preset; never execute commands from a manifest"
+    )
     replay.add_argument("manifest", type=Path)
     replay.add_argument("--out", type=Path, required=True)
     replay.add_argument("--cpu", type=int, help="explicitly remap placement on a different machine")
-    replay.add_argument("--allow-rt", action="store_true", help="renew RT consent; never inherited from saved JSON")
+    replay.add_argument(
+        "--allow-rt", action="store_true", help="renew RT consent; never inherited from saved JSON"
+    )
     replay.add_argument("--cgroup-parent", type=Path, help="renew cgroup delegation; never inherited")
     replay.add_argument("--label")
     args = parser.parse_args(argv)
     try:
         if args.command == "doctor":
-            text = json.dumps(capture(), indent=2) + "\n"
+            text = json.dumps(capture(BINARY if BINARY.is_file() else None), indent=2) + "\n"
             if args.out:
                 args.out.write_text(text)
             else:
                 print(text, end="")
             return 0
         if args.command == "report":
-            manifest = json.loads(args.manifest.read_text())
-            if manifest.get("schema_version") != 1:
-                raise ValueError("unsupported manifest schema")
+            _, manifest = load_manifest(args.manifest)
             write_report(manifest, args.out)
             print(args.out)
             return 0
         if args.command == "compare":
             print(compare(args.runs, args.out) / "report.html")
+            return 0
+        if args.command == "analyze":
+            text = render(analyze(args.runs), args.format)
+            if args.out:
+                args.out.write_text(text)
+            else:
+                print(text, end="")
             return 0
         if args.command == "replay":
             source = json.loads(args.manifest.read_text())
@@ -75,18 +95,26 @@ def main(argv=None):
                 if type(args.cpu) is not int:
                     raise ValueError("manifest selected_cpu must be an integer")
             print("Replaying preset with this checkout's implementation; compare version and binary hashes.")
-        output = args.out or Path("results") / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + args.preset)
-        manifest = run(args.preset, output, args.repetitions, args.cpu,
-                       args.allow_rt, args.cgroup_parent, args.label)
-        states = {state: sum(r["status"] == state for r in manifest["runs"])
-                  for state in ("ok", "skipped", "error")}
-        print("%s: %s" % (output / "report.html", states))
+        output = args.out or Path("results") / (
+            datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + args.preset
+        )
+        manifest = run(
+            args.preset, output, args.repetitions, args.cpu, args.allow_rt, args.cgroup_parent, args.label
+        )
+        states = {
+            state: sum(r["status"] == state for r in manifest["runs"]) for state in ("ok", "skipped", "error")
+        }
+        print(f"{output / 'report.html'}: {states}")
         for result in manifest["runs"]:
             if result["status"] != "ok":
-                print("%s: %s: %s" % (result["label"], result["status"], result["reason"]))
+                print(f"{result['label']}: {result['status']}: {result['reason']}")
+        try:
+            print(render_findings_text(analyze_manifest(manifest, output / "run.json")), end="")
+        except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+            print(f"analysis unavailable: {exc}", file=sys.stderr)
         return 1 if states["error"] else 0
     except (OSError, ValueError, KeyError) as exc:
-        print("error: %s" % exc, file=sys.stderr)
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("interrupted; started process groups cleaned up", file=sys.stderr)

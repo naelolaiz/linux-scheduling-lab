@@ -1,7 +1,9 @@
 name: build-and-test
 
 on:
+  # Branch pushes are covered by their pull request; avoid a second identical run.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -15,39 +17,106 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            compiler: g++
+            preset: gcc
           - os: ubuntu-24.04
-            compiler: clang++
+            preset: clang
           - os: ubuntu-24.04-arm
-            compiler: g++
+            preset: gcc
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    env:
+      SCHEDLAB_PRESET: ${{ matrix.preset }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: C++20 build and bounded unprivileged tests (native architecture)
-        run: make test CXX=${{ matrix.compiler }}
-      - name: Produce example report (not a performance gate)
-        run: python3 -m schedlab run quick --repetitions 1 --out results/ci
-      - uses: actions/upload-artifact@v4
+        run: uv run --locked poe test
+      - name: Example experiments (not a performance gate)
+        run: |
+          for preset in quick fairness audio; do
+            uv run --locked poe lab run "$preset" --repetitions 3 --out "results/ci/$preset" \
+              --label "${{ matrix.os }} · ${{ matrix.preset }} · $preset"
+          done
+      - name: Analysis
+        run: uv run --locked poe analyze results/ci/*/
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: results-${{ matrix.os }}-${{ matrix.compiler }}
+          name: results-${{ matrix.os }}-${{ matrix.preset }}
           path: results/ci/
           retention-days: 7
+
+  results:
+    needs: linux
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: results-*
+          path: results
+      - name: Analysis across machines in the job summary (examples, not rankings; no uv)
+        run: |
+          shopt -s nullglob
+          manifests=(results/*/*/run.json)
+          if [ ${#manifests[@]} -eq 0 ]; then
+            echo "No result manifests were uploaded." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 -m schedlab analyze "${manifests[@]}" --format markdown >> "$GITHUB_STEP_SUMMARY"
+          python3 -m schedlab analyze "${manifests[@]}" --format json --out analysis.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: analysis
+          path: analysis.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [asan, tsan]
+    env:
+      SCHEDLAB_PRESET: ${{ matrix.preset }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      # Sanitizer runtimes reserve fixed address ranges that high-entropy ASLR can collide with.
+      - name: Limit mmap randomization for the sanitizer runtimes
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Sanitized build and unprivileged tests (any report exits with status 99)
+        run: uv run --locked poe test
+
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: ruff, clang-format and clang-tidy (versions locked in uv.lock)
+        run: uv run --locked poe lint
 
   musl:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: Build static musl C++20 binary in Alpine
+      - uses: actions/checkout@v7
+      - name: Build static musl C++20 binaries in Alpine (plain CMake)
         run: |
-          docker run --rm -v "$PWD:/src" -w /src alpine:3.20 sh -ec '
-            apk add --no-cache g++ make python3
-            make CXX=g++ LDFLAGS=-static
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.24 sh -ec '
+            apk add --no-cache g++ cmake make
+            cmake --preset static
+            cmake --build --preset static --parallel
           '
-      - name: Test musl core on the host (no container scheduler/seccomp assumptions)
+      - name: Test musl core on the host (no container scheduler/seccomp assumptions; no uv)
         run: python3 -m unittest discover -s tests -v
+        env:
+          SCHEDLAB_NATIVE_DIR: build/static
 
   cross-compile:
     runs-on: ubuntu-24.04
@@ -56,8 +125,10 @@ jobs:
       matrix:
         target: [aarch64-linux-gnu, riscv64-linux-gnu]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install distribution cross toolchain
         run: sudo apt-get update -qq && sudo apt-get install -y g++-${{ matrix.target }}
       - name: Compile only (not native execution or RT validation)
-        run: make CXX=${{ matrix.target }}-g++
+        run: |
+          cmake --preset ${{ matrix.target }}
+          cmake --build --preset ${{ matrix.target }} --parallel

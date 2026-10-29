@@ -1,0 +1,81 @@
+[project]
+name = "schedlab"
+# Must equal schedlab.__version__ (recorded in manifests); a test checks this.
+version = "1.0.0"
+description = "Measured Linux scheduling labs: C++20 workloads, Python orchestration, offline reports"
+readme = "README.md"
+requires-python = ">=3.10"
+# The lab itself needs only the standard library; `python3 -m schedlab` works without uv.
+dependencies = []
+
+[dependency-groups]
+dev = ["poethepoet>=0.49"]
+# Opt-in: the format/lint tasks add this group (clang-tidy is a large, platform-specific wheel).
+lint = ["ruff~=0.17.3", "clang-format~=23.1.3", "clang-tidy~=23.1.4"]
+
+[tool.uv]
+# A checkout, not an installable package: the runner uses binaries from build/<preset>.
+package = false
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "PIE", "RUF"]
+ignore = [
+    "C408",   # dict(key=...) reads well for scheduler case specifications
+]
+# Typographic characters that reports and analyses print on purpose.
+allowed-confusables = ["–", "×"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+
+# Each task wraps one plain command, so every step also works without uv or poe.
+# Select another CMakePresets.json entry with e.g. SCHEDLAB_PRESET=clang.
+[tool.poe.env]
+SCHEDLAB_PRESET.default = "default"
+SCHEDLAB_NATIVE_DIR.default = "${POE_ROOT}/build/${SCHEDLAB_PRESET}"
+
+[tool.poe.tasks.configure]
+help = "Generate build/$SCHEDLAB_PRESET from CMakePresets.json"
+cmd = "cmake --preset ${SCHEDLAB_PRESET}"
+
+[tool.poe.tasks.build]
+help = "Configure and compile sched-work and thread-pipeline"
+sequence = ["configure", { cmd = "cmake --build --preset ${SCHEDLAB_PRESET} --parallel" }]
+
+[tool.poe.tasks.test]
+help = "Build, then run the unprivileged test suite against that build"
+sequence = ["build", { cmd = "python -m unittest discover -s tests -v" }]
+
+[tool.poe.tasks.lab]
+help = "Run the schedlab CLI against that build, e.g. `poe lab run quick`"
+cmd = "python -m schedlab"
+
+[tool.poe.tasks.analyze]
+help = "Summarize saved runs: tables, plots, findings, caveats (--format text|markdown|json)"
+cmd = "python -m schedlab analyze"
+
+# Linters run through `uv run --group lint`, so `uv run poe lint` needs no extra flags.
+[tool.poe.tasks.format]
+help = "Rewrite Python and C++ sources with ruff and clang-format"
+sequence = [
+    { cmd = "ruff check --fix-only .", executor = { type = "uv", group = "lint" } },
+    { cmd = "ruff format .", executor = { type = "uv", group = "lint" } },
+    { cmd = "clang-format -i native/*.cpp native/*.hpp", executor = { type = "uv", group = "lint" } },
+]
+
+[tool.poe.tasks.lint]
+help = "Check ruff, formatting and clang-tidy (on build/$SCHEDLAB_PRESET/compile_commands.json)"
+sequence = [
+    { cmd = "ruff check .", executor = { type = "uv", group = "lint" } },
+    { cmd = "ruff format --check .", executor = { type = "uv", group = "lint" } },
+    { cmd = "clang-format --dry-run --Werror native/*.cpp native/*.hpp", executor = { type = "uv", group = "lint" } },
+    "configure",
+    { cmd = "clang-tidy -p build/${SCHEDLAB_PRESET} --quiet native/*.cpp", executor = { type = "uv", group = "lint" } },
+]
+
+[tool.poe.tasks.clean]
+help = "Remove the native build products of $SCHEDLAB_PRESET (never results/)"
+cmd = "cmake --build --preset ${SCHEDLAB_PRESET} --target clean"

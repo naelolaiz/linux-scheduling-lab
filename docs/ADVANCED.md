@@ -78,6 +78,64 @@ bounds. [`kill(2)`](https://man7.org/linux/man-pages/man2/kill.2.html) and
 [`waitpid(2)`](https://man7.org/linux/man-pages/man2/waitpid.2.html) describe signal
 delivery and reaping; neither is a promise of recovery from a kernel/firmware hang.
 
+## Opt-in checks in containers
+
+The test suite's opt-in checks (`SCHEDLAB_TEST_RT`, `SCHEDLAB_TEST_DEADLINE`,
+`SCHEDLAB_CGROUP_PARENT`; see the [tutorial](TUTORIAL.md#12-command-reference-and-reproducibility))
+also run inside a throwaway container. The container builds from a read-only
+copy of the checkout and is deleted on exit. It shares the host kernel, so the
+real scheduler is exercised. Run these from the repository root on an otherwise
+idle machine; they are commands for you to run, and the lab never invokes sudo.
+
+**FIFO/RR and priority inheritance, unprivileged.** These need only an RT-priority
+limit. Rootless podman can pass one down when your hard limit allows it
+(`ulimit -Hr` of at least 12, because the lock demo uses priorities 10 to 12). This
+also runs the RT presets and prints their analysis:
+
+```sh
+podman run --rm --ulimit rtprio=12:12 -v "$PWD:/src:ro" docker.io/library/ubuntu:24.04 bash -euc '
+apt-get update -qq && apt-get install -y -qq --no-install-recommends g++ cmake make python3 >/dev/null
+mkdir /tmp/w && tar -C /src --exclude=./build --exclude=./.venv --exclude=./results -cf - . | tar -C /tmp/w -xf -
+cd /tmp/w && cmake --preset default >/dev/null && cmake --build --preset default --parallel >/dev/null
+SCHEDLAB_TEST_RT=1 python3 -m unittest discover -s tests -k opt_in_rt -v
+for preset in rt sharing locks; do python3 -m schedlab run $preset --allow-rt --repetitions 3 --out results/$preset >/dev/null; done
+python3 -m schedlab analyze results/rt results/sharing results/locks'
+```
+
+**DEADLINE and delegated cgroups, as root.** DEADLINE needs `CAP_SYS_NICE` in the
+host's initial user namespace, which a rootless container cannot hold. The cgroup
+check needs a delegated cgroup v2 subtree. A rootful privileged container provides
+both. With `--cgroupns=private` the delegation below lives inside the container's
+own cgroup, so nothing else on the host changes. The script first empties the
+namespace root, because a cgroup that enables controllers for its children cannot
+hold processes itself. It then runs the tests from a leaf beside the test parent,
+because a migration needs write access at the common ancestor:
+
+```sh
+sudo podman run --rm --privileged --cgroupns=private -v "$PWD:/src:ro" docker.io/library/ubuntu:24.04 bash -euc '
+apt-get update -qq && apt-get install -y -qq --no-install-recommends g++ cmake make python3 >/dev/null
+mkdir /tmp/w && tar -C /src --exclude=./build --exclude=./.venv --exclude=./results -cf - . | tar -C /tmp/w -xf -
+cd /tmp/w && cmake --preset default >/dev/null && cmake --build --preset default --parallel >/dev/null
+cg=/sys/fs/cgroup
+mkdir $cg/init && echo $$ > $cg/init/cgroup.procs
+echo +cpu > $cg/cgroup.subtree_control
+mkdir -p $cg/lab/shell && echo +cpu > $cg/lab/cgroup.subtree_control
+echo $$ > $cg/lab/shell/cgroup.procs
+SCHEDLAB_TEST_RT=1 SCHEDLAB_TEST_DEADLINE=1 SCHEDLAB_CGROUP_PARENT=$cg/lab \
+  python3 -m unittest discover -s tests -k opt_in -v'
+```
+
+Do not add `--cpuset-cpus`: SCHED_DEADLINE refuses tasks whose affinity does not
+span their scheduling domain. If DEADLINE still fails with EPERM, the container's
+seccomp profile is the likely cause.
+
+**Sources:** [`podman-run(1)`](https://docs.podman.io/en/latest/markdown/podman-run.1.html)
+for `--ulimit`, `--privileged` and `--cgroupns`;
+[`user_namespaces(7)`](https://man7.org/linux/man-pages/man7/user_namespaces.7.html)
+for why namespaced capabilities do not grant host scheduling privileges;
+[`cgroup_namespaces(7)`](https://man7.org/linux/man-pages/man7/cgroup_namespaces.7.html)
+and the [delegation rules](https://docs.kernel.org/admin-guide/cgroup-v2.html#delegation).
+
 ## Delegated cgroups without assuming systemd
 
 Cgroup v2 is a kernel interface; OpenRC and containers can use it without systemd.
@@ -131,7 +189,7 @@ Requires `memory` already enabled for children. In your new leaf:
 printf '25165824\n' > "$LEAF/memory.high"
 printf '67108864\n' > "$LEAF/memory.max"
 mkdir -p results/memory-control
-python3 -m schedlab.exec "$LEAF" "$PWD/build/sched-work" \
+python3 -m schedlab.exec "$LEAF" "$PWD/build/default/sched-work" \
   --mode audio --jobs 30 --memory demand --output results/memory-control/probe \
   > results/memory-control/native.json
 cat "$LEAF/memory.events"

@@ -1,8 +1,6 @@
-import csv
 import json
 import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
 import tempfile
@@ -11,36 +9,38 @@ import unittest
 from unittest.mock import patch
 import wave
 
+from schedlab.analysis import analyze, analyze_manifest, bar, compare_analyses, render
 from schedlab.cgroups import Unavailable, cpu_groups
-from schedlab.environment import capture, kernel_config, read
+from schedlab.environment import capture, kernel_config, native_build, read
 from schedlab.metrics import distribution, quantile, summarize
-from schedlab.report import compare, write_report
-from schedlab.runner import BINARY, ROOT, cases, run, run_group
+from schedlab.report import build_summary, compare, write_report
+from schedlab.runner import BINARY, NATIVE_DIR, ROOT, cases, run, run_group
+
+PIPELINE = NATIVE_DIR / "thread-pipeline"
 
 
 class MetricsTests(unittest.TestCase):
     def test_interpolation(self):
-        self.assertEqual(quantile([10, 0, 20], .5), 10)
-        self.assertAlmostEqual(quantile([0, 100], .95), 95)
-        self.assertEqual(quantile([42], .99), 42)
+        self.assertEqual(quantile([10, 0, 20], 0.5), 10)
+        self.assertAlmostEqual(quantile([0, 100], 0.95), 95)
+        self.assertEqual(quantile([42], 0.99), 42)
         self.assertEqual(distribution([2, 8])["max"], 8)
         self.assertEqual(distribution([])["n"], 0)
         self.assertIsNone(distribution([])["p99"])
 
     def test_invalid_quantile(self):
-        for values, q in (([], .5), ([1], -1), ([1], 2)):
+        for values, q in (([], 0.5), ([1], -1), ([1], 2)):
             with self.assertRaises(ValueError):
                 quantile(values, q)
 
     def test_exact_metrics_and_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "raw.csv"
-            path.write_text("index,release_ns,start_ns,finish_ns,cpu_ns\n"
-                            "0,100,102,110,5\n1,110,114,123,6\n")
+            path.write_text("index,release_ns,start_ns,finish_ns,cpu_ns\n0,100,102,110,5\n1,110,114,123,6\n")
             core = {"samples": 2, "period_ns": 10, "effective": {"policy": "other"}}
             metric = summarize(path, core)
             self.assertEqual(metric["deadline_misses"], 1)  # Equality is on time.
-            self.assertEqual(metric["miss_fraction"], .5)
+            self.assertEqual(metric["miss_fraction"], 0.5)
             self.assertEqual(metric["cpu_total_ns"], 11)
             self.assertEqual(metric["response_ns"]["max"], 13)
             core.update(window_ns=20, period_ns=0)
@@ -53,8 +53,7 @@ class MetricsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "raw.csv"
             path.write_text("index,release_ns,start_ns,finish_ns,cpu_ns\n")
-            core = {"samples": 0, "period_ns": 0, "window_ns": 100,
-                    "effective": {"policy": "idle"}}
+            core = {"samples": 0, "period_ns": 0, "window_ns": 100, "effective": {"policy": "idle"}}
             metric = summarize(path, core)
             self.assertEqual(metric["throughput_jobs_s"], 0)
             self.assertIsNone(metric["wall_processing_ns"]["max"])
@@ -63,8 +62,12 @@ class MetricsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "raw.csv"
             path.write_text("index,release_ns,start_ns,finish_ns,cpu_ns\n0,0,0,6000,4000\n")
-            core = {"samples": 1, "period_ns": 10000, "deadline": {"deadline_us": 5},
-                    "effective": {"policy": "deadline"}}
+            core = {
+                "samples": 1,
+                "period_ns": 10000,
+                "deadline": {"deadline_us": 5},
+                "effective": {"policy": "deadline"},
+            }
             self.assertEqual(summarize(path, core)["deadline_misses"], 1)
 
 
@@ -76,8 +79,9 @@ class NativeTests(unittest.TestCase):
         self.cpu = min(os.sched_getaffinity(0))
 
     def invoke(self, *args):
-        return subprocess.run([str(BINARY), "--output", str(self.prefix), *args],
-                              text=True, capture_output=True, timeout=18)
+        return subprocess.run(
+            [str(BINARY), "--output", str(self.prefix), *args], text=True, capture_output=True, timeout=18
+        )
 
     def success(self, *args):
         result = self.invoke(*args)
@@ -111,7 +115,7 @@ class NativeTests(unittest.TestCase):
         image = self.prefix.with_suffix(".pgm").read_bytes()
         header = b"P5\n160 90\n255\n"
         self.assertTrue(image.startswith(header))
-        self.assertEqual(len(image)-len(header), 160*90)
+        self.assertEqual(len(image) - len(header), 160 * 90)
         self.assertGreater(data["checksum"], 0)
 
     def test_video_frame_independent_of_warmup(self):
@@ -122,22 +126,54 @@ class NativeTests(unittest.TestCase):
 
     def test_fault_probe(self):
         demand = self.success("--mode", "audio", "--jobs", "4", "--period-us", "1000", "--memory", "demand")
-        prefault = self.success("--mode", "audio", "--jobs", "4", "--period-us", "1000", "--memory", "prefault")
+        prefault = self.success(
+            "--mode", "audio", "--jobs", "4", "--period-us", "1000", "--memory", "prefault"
+        )
         self.assertGreater(demand["minor_faults"], prefault["minor_faults"])
         self.assertEqual(demand["checksum"], prefault["checksum"])
 
     def test_invalid_options(self):
-        invalid = (("--jobs", "0"), ("--work", "nope"), ("--policy", "imaginary"),
-                   ("--nice", "20"), ("--priority", "99"), ("--mode", "lock"),
-                   ("--mode", "audio", "--duration-ms", "1"), ("--start-ns", "-1"),
-                   ("--mode", "audio", "--jobs", "20000", "--period-us", "100000"),
-                   ("--policy", "deadline", "--mode", "audio", "--cpu", str(self.cpu)),
-                   ("--policy", "deadline", "--mode", "audio", "--runtime-us", "9000"),
-                   ("--policy", "deadline", "--mode", "audio", "--deadline-us", "20000"))
+        invalid = (
+            ("--jobs", "0"),
+            ("--work", "nope"),
+            ("--policy", "imaginary"),
+            ("--nice", "20"),
+            ("--priority", "99"),
+            ("--mode", "lock"),
+            ("--mode", "audio", "--duration-ms", "1"),
+            ("--start-ns", "-1"),
+            ("--mode", "audio", "--jobs", "20000", "--period-us", "100000"),
+            ("--policy", "deadline", "--mode", "audio", "--cpu", str(self.cpu)),
+            ("--policy", "deadline", "--mode", "audio", "--runtime-us", "9000"),
+            ("--policy", "deadline", "--mode", "audio", "--deadline-us", "20000"),
+            ("--unknown", "1"),
+            ("--allow-rt=yes",),
+            ("stray-argument",),
+            ("--jobs",),
+        )
         for args in invalid:
             with self.subTest(args=args):
                 result = self.invoke(*args)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_option_value_forms_and_help(self):
+        data = self.success("--jobs=3", "--policy=batch", "--nice", "2")
+        self.assertEqual(
+            (data["samples"], data["effective"]["policy"], data["effective"]["nice"]), (3, "batch", 2)
+        )
+        result = subprocess.run([str(BINARY), "--help"], text=True, capture_output=True, timeout=18)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Exit codes", result.stdout)
+
+    def test_build_info_matches_results(self):
+        result = subprocess.run([str(BINARY), "--build-info"], text=True, capture_output=True, timeout=18)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build = json.loads(result.stdout)["build"]
+        for key in ("compiler_id", "compiler_version", "build_type", "cxx_flags", "standard_library", "libc"):
+            self.assertIsInstance(build[key], str, key)
+        self.assertGreaterEqual(build["cxx_standard"], 202002)
+        self.assertIsInstance(build["cross_compiled"], bool)
+        self.assertEqual(self.success("--jobs", "1")["build"], build)
 
     def test_rt_never_silently_falls_back(self):
         for policy in ("fifo", "rr", "deadline"):
@@ -152,14 +188,18 @@ class NativeTests(unittest.TestCase):
         result = self.invoke("--mode", "audio", "--jobs", "1000", "--timeout-ms", "100")
         self.assertEqual(result.returncode, 1)
         self.assertIn("watchdog", json.loads(result.stdout)["reason"])
-        self.assertLess(time.monotonic()-begin, 3)
+        self.assertLess(time.monotonic() - begin, 3)
 
     @unittest.skipUnless(Path("/dev/full").exists(), "requires the Linux full device")
     def test_stdout_failure_is_not_success(self):
         with Path("/dev/full").open("wb") as full:
             result = subprocess.run(
                 [str(BINARY), "--output", str(self.prefix), "--jobs", "1"],
-                stdout=full, stderr=subprocess.PIPE, text=True, timeout=18)
+                stdout=full,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=18,
+            )
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("standard output", result.stderr)
 
@@ -176,13 +216,23 @@ class NativeTests(unittest.TestCase):
         if len(os.sched_getaffinity(0)) < 2:
             self.skipTest("need two allowed CPUs")
         for policy in ("fifo", "rr"):
-            data = self.success("--policy", policy, "--cpu", str(self.cpu), "--mode", "audio",
-                                "--jobs", "5", "--allow-rt")
+            data = self.success(
+                "--policy", policy, "--cpu", str(self.cpu), "--mode", "audio", "--jobs", "5", "--allow-rt"
+            )
             self.assertEqual(data["effective"]["priority"], 10)
         waits = {}
         for protocol in ("none", "inherit"):
-            data = self.success("--mode", "lock", "--policy", "fifo", "--cpu", str(self.cpu),
-                                "--allow-rt", "--protocol", protocol)
+            data = self.success(
+                "--mode",
+                "lock",
+                "--policy",
+                "fifo",
+                "--cpu",
+                str(self.cpu),
+                "--allow-rt",
+                "--protocol",
+                protocol,
+            )
             waits[protocol] = data["lock"]
         self.assertLess(waits["none"]["medium_finish_ns"], waits["none"]["low_finish_ns"])
         self.assertGreater(waits["inherit"]["medium_finish_ns"], waits["inherit"]["low_finish_ns"])
@@ -197,8 +247,20 @@ class NativeTests(unittest.TestCase):
 class HarnessTests(unittest.TestCase):
     def test_case_contract(self):
         self.assertNotIn("cpu", cases("deadline", 1, 2)[0][0])
-        for preset in ("quick", "offline", "fairness", "audio", "video", "mixed", "affinity",
-                       "rt", "sharing", "deadline", "locks", "memory"):
+        for preset in (
+            "quick",
+            "offline",
+            "fairness",
+            "audio",
+            "video",
+            "mixed",
+            "affinity",
+            "rt",
+            "sharing",
+            "deadline",
+            "locks",
+            "memory",
+        ):
             groups = cases(preset, 1, 2)
             labels = [spec["case"] for group in groups for spec in group]
             self.assertEqual(len(labels), len(set(labels)), preset)
@@ -209,7 +271,7 @@ class HarnessTests(unittest.TestCase):
             root = Path(directory)
             output = root / "quick"
             manifest = run("quick", output, repetitions=1)
-            self.assertEqual([r["status"] for r in manifest["runs"]], ["ok"]*3)
+            self.assertEqual([r["status"] for r in manifest["runs"]], ["ok"] * 3)
             self.assertEqual(manifest["environment"]["system"]["architecture"], os.uname().machine)
             self.assertTrue((output / "run.json").is_file())
             text = (output / "report.html").read_text()
@@ -226,10 +288,26 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("&lt;script&gt;", escaped)
             self.assertNotIn("<script>alert(1)</script>", escaped)
             self.assertNotIn("href='javascript:", escaped)
+            self.assertIn('id="findings-title"', text)
+            self.assertIn("of jobs finished before the next release", text)
             compare([output, output / "run.json"], root / "comparison")
             combined = json.loads((root / "comparison/run.json").read_text())
             self.assertEqual(len(combined["runs"]), 6)
             self.assertTrue(combined["runs"][0]["artifact_prefix"].startswith("file:"))
+            result = analyze([output, output / "run.json"])
+            self.assertEqual(
+                [row["case"] for row in result["comparison"]["tables"][0]["rows"]],
+                ["offline", "audio", "video"],
+            )
+            self.assertIn("Comparison across runs", render(result, "text"))
+            self.assertIn("<details>", render(result, "markdown"))
+            self.assertEqual(json.loads(render(result, "json"))["schema_version"], 1)
+            from schedlab.__main__ import main
+
+            self.assertEqual(
+                main(["analyze", str(output), "--out", str(root / "analysis.md"), "--format", "markdown"]), 0
+            )
+            self.assertIn("| audio |", (root / "analysis.md").read_text())
             with self.assertRaises(FileExistsError):
                 run("quick", output, repetitions=1)
 
@@ -237,47 +315,70 @@ class HarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             manifest = run("cgroup", Path(directory) / "result", repetitions=1)
             self.assertEqual(manifest["runs"][0]["status"], "skipped")
-            with self.assertRaises(Unavailable):
-                with cpu_groups(directory, [{"cpu.weight": "100"}]):
-                    self.fail("ordinary directory accepted as cgroup")
-            for name, value in (("cgroup.controllers", "cpu"), ("cgroup.subtree_control", "cpu"),
-                                ("cgroup.type", "domain")):
+            with self.assertRaises(Unavailable), cpu_groups(directory, [{"cpu.weight": "100"}]):
+                self.fail("ordinary directory accepted as cgroup")
+            for name, value in (
+                ("cgroup.controllers", "cpu"),
+                ("cgroup.subtree_control", "cpu"),
+                ("cgroup.type", "domain"),
+            ):
                 (Path(directory) / name).write_text(value)
-            with self.assertRaises(Unavailable):
-                with cpu_groups(directory, [{"cpu.weight": "100"}]):
-                    self.fail("lookalike files must not masquerade as real kernel controls")
+            with self.assertRaises(Unavailable), cpu_groups(directory, [{"cpu.weight": "100"}]):
+                self.fail("lookalike files must not masquerade as real kernel controls")
 
     def test_harness_timeout_reaps_process_group(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = root / "hang"
             pidfile = root / "child"
-            script.write_text("#!%s\nimport os,time\nfrom pathlib import Path\n"
-                              "pid=os.fork()\n"
-                              "if pid == 0:\n Path(%r).write_text(str(os.getpid()))\n"
-                              "time.sleep(30)\n" % (sys.executable, str(pidfile)))
+            script.write_text(
+                f"#!{sys.executable}\nimport os,time\nfrom pathlib import Path\n"
+                "pid=os.fork()\n"
+                f"if pid == 0:\n Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
+                "time.sleep(30)\n"
+            )
             script.chmod(0o700)
-            records = run_group([{"case": "hang"}], root, 1, binary=script, timeout=.3)
+            records = run_group([{"case": "hang"}], root, 1, binary=script, timeout=0.3)
             self.assertEqual(records[0]["status"], "error")
             self.assertIn("timeout", records[0]["reason"])
             pid = int(pidfile.read_text())
-            state = Path("/proc/%d/stat" % pid)
+            state = Path(f"/proc/{pid}/stat")
             if state.exists():
                 self.assertEqual(state.read_text().split()[2], "Z")  # Exited; awaiting init reaping.
 
+    def test_project_version_matches_manifest_version(self):
+        from schedlab import __version__
+
+        text = (ROOT / "pyproject.toml").read_text()
+        self.assertIn(f'\nversion = "{__version__}"\n', text)
+
     def test_cli_invalid(self):
-        result = subprocess.run([sys.executable, "-m", "schedlab", "run", "quick", "--repetitions", "0"],
-                                cwd=ROOT, capture_output=True, timeout=5)
+        result = subprocess.run(
+            [sys.executable, "-m", "schedlab", "run", "quick", "--repetitions", "0"],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=5,
+        )
         self.assertEqual(result.returncode, 2)
 
     def test_replay_does_not_inherit_privilege_or_commands(self):
         from schedlab.__main__ import main
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "input.json"
-            source.write_text(json.dumps({"schema_version": 1, "preset": "deadline",
-                                          "repetitions": 1, "selected_cpu": min(os.sched_getaffinity(0)),
-                                          "allow_rt": True, "runs": [{"command": ["do-not-execute"]}]}))
+            source.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "preset": "deadline",
+                        "repetitions": 1,
+                        "selected_cpu": min(os.sched_getaffinity(0)),
+                        "allow_rt": True,
+                        "runs": [{"command": ["do-not-execute"]}],
+                    }
+                )
+            )
             self.assertEqual(main(["replay", str(source), "--out", str(root / "output")]), 0)
             manifest = json.loads((root / "output/run.json").read_text())
             self.assertFalse(manifest["allow_rt"])
@@ -288,9 +389,11 @@ class HarnessTests(unittest.TestCase):
     def test_interrupt_manifest_is_not_success(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "interrupted"
-            with patch("schedlab.runner.run_group", side_effect=KeyboardInterrupt):
-                with self.assertRaises(KeyboardInterrupt):
-                    run("quick", output, repetitions=1)
+            with (
+                patch("schedlab.runner.run_group", side_effect=KeyboardInterrupt),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                run("quick", output, repetitions=1)
             self.assertEqual(json.loads((output / "run.json").read_text())["status"], "interrupted")
             self.assertIn("interrupted", (output / "report.html").read_text())
 
@@ -300,15 +403,224 @@ class HarnessTests(unittest.TestCase):
         before = set(parent.iterdir())
         with tempfile.TemporaryDirectory() as directory:
             manifest = run("cgroup", Path(directory) / "run", repetitions=1, parent=parent)
-            self.assertEqual([r["status"] for r in manifest["runs"]], ["ok"]*4)
+            self.assertEqual([r["status"] for r in manifest["runs"]], ["ok"] * 4)
         self.assertEqual(set(parent.iterdir()), before)
+
+
+def synthetic_run(case, repetition=1, policy="other", nice=0, mode="offline", core=None, **metrics):
+    effective = {"policy": policy, "nice": nice, "rr_quantum_ns": 100_000_000}
+    return {
+        "case": case,
+        "label": f"{case}-r{repetition}",
+        "repetition": repetition,
+        "status": "ok",
+        "core": {"mode": mode, "effective": effective, **(core or {})},
+        "metrics": metrics,
+    }
+
+
+class AnalysisTests(unittest.TestCase):
+    def test_fairness_share_against_load_weights(self):
+        manifest = {
+            "schema_version": 1,
+            "preset": "fairness",
+            "repetitions": 1,
+            "runs": [
+                synthetic_run("fair-other-10-control", cpu_total_ns=900, throughput_jobs_s=90),
+                synthetic_run("fair-other-10-candidate", nice=10, cpu_total_ns=100, throughput_jobs_s=10),
+                synthetic_run("fair-idle-0-control", cpu_total_ns=995),
+                synthetic_run("fair-idle-0-candidate", policy="idle", cpu_total_ns=5),
+            ],
+        }
+        analysis = analyze_manifest(manifest)
+        shares = {f["data"]["case"]: f["data"] for f in analysis["findings"] if "case" in f["data"]}
+        self.assertAlmostEqual(shares["fair-other-10-candidate"]["measured_share"], 0.1)
+        self.assertAlmostEqual(shares["fair-other-10-candidate"]["model_share"], 110 / (110 + 1024))
+        self.assertAlmostEqual(shares["fair-idle-0-candidate"]["model_share"], 3 / (3 + 1024))
+        self.assertTrue(any("1 repetition" in caveat for caveat in analysis["caveats"]))
+        self.assertEqual(analysis["cases"][0]["metric"]["key"], "throughput_jobs_s")
+
+    def test_priority_inversion_and_sharing_order(self):
+        def lock(low, medium):
+            return {"lock": {"low_finish_ns": low, "medium_finish_ns": medium, "high_wait_ns": 4_000_000}}
+
+        locks = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "locks",
+                "runs": [
+                    synthetic_run("lock-none", mode="lock", core=lock(200, 100)),
+                    synthetic_run("lock-inherit", mode="lock", core=lock(100, 200)),
+                ],
+            }
+        )
+        self.assertEqual([f["data"]["inverted"] for f in locks["findings"]], [1, 0])
+        sharing = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "sharing",
+                "runs": [
+                    synthetic_run("sharing-fifo-0", first_start_ns=0, last_finish_ns=10_000_000),
+                    synthetic_run("sharing-fifo-1", first_start_ns=10_500_000, last_finish_ns=20_000_000),
+                    synthetic_run("sharing-rr-0", first_start_ns=0, last_finish_ns=19_000_000),
+                    synthetic_run("sharing-rr-1", first_start_ns=1_000_000, last_finish_ns=20_000_000),
+                ],
+            }
+        )
+        overlap = {f["data"]["policy"]: f["data"]["overlap_ms"] for f in sharing["findings"]}
+        self.assertLess(overlap["fifo"], 0)
+        self.assertAlmostEqual(overlap["rr"], 18.0)
+
+    def test_cgroup_weight_and_quota(self):
+        def group(case, control, **metrics):
+            run = synthetic_run(case, **metrics)
+            run["cgroup"] = {"requested": control}
+            return run
+
+        analysis = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "cgroup",
+                "runs": [
+                    group("cgroup-weight-0", {"cpu.weight": "100"}, cpu_total_ns=200),
+                    group("cgroup-weight-1", {"cpu.weight": "400"}, cpu_total_ns=800),
+                    group("cgroup-quota-1", {"cpu.max": "20000 100000"}, cpu_total_ns=19, elapsed_ns=100),
+                ],
+            }
+        )
+        weight, quota = analysis["findings"]
+        self.assertAlmostEqual(weight["data"]["measured_share"], 0.8)
+        self.assertAlmostEqual(weight["data"]["model_share"], 0.8)
+        self.assertAlmostEqual(quota["data"]["used"], 0.19)
+
+    def test_caveats_rendering_and_differences(self):
+        build = {
+            "compiler_id": "GNU",
+            "compiler_version": "13",
+            "build_type": "RelWithDebInfo",
+            "sanitize": "thread",
+        }
+        manifest = {
+            "schema_version": 1,
+            "preset": "quick",
+            "repetitions": 3,
+            "environment": {"native_build": build},
+            "runs": [synthetic_run("a|b", mode="audio", response_ns={"p99": 2e6}, miss_fraction=0.5)],
+        }
+        first = analyze_manifest(manifest, "one")
+        self.assertTrue(any("not measurements" in caveat for caveat in first["caveats"]))
+        markdown = render({"schema_version": 1, "runs": [first], "comparison": None}, "markdown")
+        self.assertIn("a\\|b", markdown)
+        second = dict(first, build="Clang 18 RelWithDebInfo")
+        self.assertIn("native build", compare_analyses([first, second])["differences"])
+        self.assertEqual(bar(5, 10, width=4), "██")
+        self.assertEqual(bar(1, 80, width=1), "▏")
+        self.assertEqual(bar(None, 10), "")
+
+    def test_rt_policies_and_background_cpu_time(self):
+        def audio(policy, p99_ms):
+            return synthetic_run(
+                f"rt-audio-{policy}", policy=policy, mode="audio", response_ns={"p99": p99_ms * 1e6}
+            )
+
+        def background(policy, jobs_s):
+            return synthetic_run(
+                f"rt-background-{policy}", throughput_jobs_s=jobs_s, cpu_total_ns=582e6, elapsed_ns=600e6
+            )
+
+        analysis = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "rt",
+                "runs": [
+                    audio("other", 0.8),
+                    background("other", 1277),
+                    audio("fifo", 0.09),
+                    background("fifo", 1823),
+                    audio("rr", 0.07),
+                    background("rr", 1828),
+                ],
+            }
+        )
+        rt, contender = (finding["text"] for finding in analysis["findings"])
+        self.assertIn("FIFO and RR behave the same", rt)
+        self.assertNotIn("Lowest tail", rt)
+        self.assertIn("97% of a CPU", contender)
+        self.assertIn("speed per CPU-second", contender)
+
+    def test_lowest_tail_only_when_ranges_are_apart(self):
+        def mixed(policy, *p99_ms):
+            return [
+                synthetic_run(
+                    f"mixed-audio-{policy}", repetition, mode="audio", response_ns={"p99": value * 1e6}
+                )
+                for repetition, value in enumerate(p99_ms, 1)
+            ]
+
+        overlapping = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "mixed",
+                "runs": [*mixed("other", 1.0, 2.0), *mixed("idle", 1.5, 2.5)],
+            }
+        )
+        self.assertIn("none is clearly lowest", overlapping["findings"][0]["text"])
+        apart = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "mixed",
+                "runs": [*mixed("other", 2.0, 2.2), *mixed("idle", 1.0, 1.1)],
+            }
+        )
+        self.assertIn("Lowest tail: idle background", apart["findings"][0]["text"])
+
+    def test_busy_machine_and_frequency_caveats(self):
+        def ok(value):
+            return {"status": "ok", "value": value}
+
+        def environment(loadavg):
+            pressure = (
+                "some avg10=30.00 avg60=25.50 avg300=10.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00"
+            )
+            return {
+                "runtime": {"/sys/devices/system/cpu/online": ok("0-15")},
+                "load": {"loadavg": ok(loadavg), "cpu_pressure": ok(pressure)},
+                "cpu_topology": {
+                    "0": {
+                        "cpufreq/scaling_governor": ok("powersave"),
+                        "cpufreq/scaling_driver": ok("amd-pstate-epp"),
+                        "cpufreq/energy_performance_preference": ok("balance_performance"),
+                    }
+                },
+            }
+
+        def caveats(before, after):
+            manifest = {
+                "schema_version": 1,
+                "preset": "quick",
+                "repetitions": 3,
+                "selected_cpu": 0,
+                "environment": environment(before),
+                "environment_after": {"load": environment(after)["load"]},
+                "runs": [],
+            }
+            return analyze_manifest(manifest)["caveats"]
+
+        busy = caveats("9.10 7.00 5.00 17/900 1", "8.00 7.00 5.00 2/900 1")
+        self.assertTrue(any("16 just before and 1 just after" in c and "25.50%" in c for c in busy), busy)
+        self.assertFalse(
+            any("Other work" in c for c in caveats("0.30 0.20 0.10 2/900 1", "0.40 0.20 0.10 3/900 1"))
+        )
+        self.assertTrue(any("driver amd-pstate-epp, EPP balance_performance" in c for c in busy))
 
 
 class EnvironmentTests(unittest.TestCase):
     def test_missing_is_explicit(self):
         self.assertEqual(read("/definitely-not-a-schedlab-file")["status"], "unavailable")
-        with patch("schedlab.environment.gzip.open", side_effect=PermissionError("denied")), \
-             patch("schedlab.environment.Path.read_text", side_effect=PermissionError("denied")):
+        with (
+            patch("schedlab.environment.gzip.open", side_effect=PermissionError("denied")),
+            patch("schedlab.environment.Path.read_text", side_effect=PermissionError("denied")),
+        ):
             config = kernel_config("test-kernel")
         self.assertEqual(config["status"], "unavailable")
         self.assertEqual(config["options"]["CONFIG_PREEMPT_RT"], "unknown")
@@ -320,6 +632,18 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIn("RLIMIT_RTTIME", data["limits"])
         self.assertEqual(len(data["binary_sha256"]), 64)
         self.assertIn("ancestors", data["cgroup"])
+        self.assertIn("loadavg", data["load"])
+        self.assertTrue(data["native_build"]["compiler_id"])
+        self.assertIn(data["native_build"]["compiler_id"], build_summary(data["native_build"]))
+
+    def test_unreadable_native_build_is_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "not-sched-work"
+            script.write_text(f"#!{sys.executable}\nprint('not json')\n")
+            script.chmod(0o700)
+            build = native_build(script)
+        self.assertEqual(build["status"], "unavailable")
+        self.assertEqual(build_summary(build), "unknown native build")
 
 
 class PipelineTests(unittest.TestCase):
@@ -328,37 +652,56 @@ class PipelineTests(unittest.TestCase):
             path = Path(directory) / "pipeline.wav"
             for delay in (0, 50):
                 result = subprocess.run(
-                    [str(ROOT / "build/thread-pipeline"), "--output", str(path),
-                     "--buffers", "20", "--consumer-delay-ms", str(delay)],
-                    capture_output=True, text=True, timeout=5)
+                    [
+                        str(PIPELINE),
+                        "--output",
+                        str(path),
+                        "--buffers",
+                        "20",
+                        "--consumer-delay-ms",
+                        str(delay),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 data = json.loads(result.stdout)
-                self.assertEqual(data["consumed"]+data["dropped"], 20)
+                self.assertEqual(data["consumed"] + data["dropped"], 20)
                 self.assertFalse(data["device_xruns_measured"])
                 with wave.open(str(path), "rb") as wav:
-                    self.assertEqual(wav.getnframes(), 20*480)
+                    self.assertEqual(wav.getnframes(), 20 * 480)
                     self.assertEqual(wav.getframerate(), 48000)
                     self.assertNotEqual(set(wav.readframes(480)), {0})
 
     def test_pipeline_bounds(self):
         for value in ("0", "101", "not-a-number"):
             result = subprocess.run(
-                [str(ROOT / "build/thread-pipeline"), "--output", "/dev/null", "--buffers", value],
-                capture_output=True, text=True, timeout=5)
+                [str(PIPELINE), "--output", "/dev/null", "--buffers", value],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
             self.assertEqual(result.returncode, 2)
 
     @unittest.skipUnless(Path("/dev/full").exists(), "requires the Linux full device")
     def test_pipeline_write_failures_are_not_success(self):
         media_failure = subprocess.run(
-            [str(ROOT / "build/thread-pipeline"), "--output", "/dev/full", "--buffers", "1"],
-            capture_output=True, text=True, timeout=5)
+            [str(PIPELINE), "--output", "/dev/full", "--buffers", "1"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         self.assertEqual(media_failure.returncode, 1)
 
         with tempfile.TemporaryDirectory() as directory, Path("/dev/full").open("wb") as full:
             output_failure = subprocess.run(
-                [str(ROOT / "build/thread-pipeline"), "--output", str(Path(directory) / "ok.wav"),
-                 "--buffers", "1"],
-                stdout=full, stderr=subprocess.PIPE, text=True, timeout=5)
+                [str(PIPELINE), "--output", str(Path(directory) / "ok.wav"), "--buffers", "1"],
+                stdout=full,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
         self.assertEqual(output_failure.returncode, 1)
         self.assertIn("standard output", output_failure.stderr)
 

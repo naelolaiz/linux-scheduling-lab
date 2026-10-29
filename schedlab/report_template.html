@@ -136,6 +136,11 @@
     .insights li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; padding: 11px; border-radius: 11px; background: var(--bg-elevated); color: var(--muted); font-size: 12px; }
     .insight-number { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); font: 700 10px/1 var(--mono); }
     .insights strong { color: var(--text); font-weight: 650; }
+    .findings-panel { margin: 0 0 14px; }
+    .findings { margin-top: 0; }
+    .findings li { font-size: 13px; color: var(--text); }
+    .findings .caveat { color: var(--muted); }
+    .findings .caveat .insight-number { background: color-mix(in srgb, var(--amber) 16%, transparent); color: var(--amber); }
     .section { margin-top: 14px; padding: 22px; }
     .table-scroll { overflow: auto; margin: 0 -22px -22px; border-radius: 0 0 var(--radius) var(--radius); }
     table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -232,6 +237,11 @@
         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 6.5v4.25m0 2.75h.01M17.25 10A7.25 7.25 0 1 1 2.75 10a7.25 7.25 0 0 1 14.5 0Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
         <div><strong>Read these as observations, not guarantees.</strong> Synthetic audio misses are not hardware XRUNs; observed maxima are not worst-case execution times. Offline response and lateness accumulate from a shared release. Instrumentation and host interference remain part of every result.</div>
       </aside>
+
+      <section class="panel section findings-panel" aria-labelledby="findings-title">
+        <div class="panel-heading"><div><span class="kicker">Analysis</span><h2 id="findings-title">Findings</h2><p>Preset-aware comparisons and caveats from these results; <code>schedlab analyze</code> prints the same.</p></div></div>
+        <ul class="insights findings">@@FINDINGS@@</ul>
+      </section>
 
       <section class="controls panel" aria-label="Dashboard filters">
         <div class="field"><label for="search">Find a run</label><input id="search" type="search" placeholder="Label, case, mode, policy…" autocomplete="off"></div>

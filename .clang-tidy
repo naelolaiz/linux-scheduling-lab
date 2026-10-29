@@ -1,0 +1,37 @@
+# Static analysis for native/; `uv run poe lint` runs it on build/<preset>/compile_commands.json.
+# Disabled checks are style preferences that do not fit this small POSIX-facing code:
+# - designated initializers, trailing commas: positional option tables and aggregate returns
+# - math parentheses: ordinary arithmetic precedence needs none
+# - pragma once: supported by every targeted compiler
+# - enum size: a few tiny enums; their size never matters
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  clang-analyzer-*,
+  concurrency-*,
+  misc-*,
+  -misc-include-cleaner,
+  -misc-non-private-member-variables-in-classes,
+  modernize-*,
+  -modernize-avoid-c-arrays,
+  -modernize-use-designated-initializers,
+  -modernize-use-trailing-return-type,
+  performance-*,
+  -performance-enum-size,
+  portability-*,
+  -portability-avoid-pragma-once,
+  readability-*,
+  -readability-braces-around-statements,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-implicit-bool-conversion,
+  -readability-magic-numbers,
+  -readability-math-missing-parentheses,
+  -readability-trailing-comma
+CheckOptions:
+  bugprone-signed-bitwise.IgnorePositiveIntegerLiterals: true
+  misc-const-correctness.AnalyzePointers: false
+  performance-unnecessary-value-param.AllowedTypes: 'std::stop_token'
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'native/'

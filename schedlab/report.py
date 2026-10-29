@@ -7,6 +7,7 @@ import re
 import statistics
 from urllib.parse import urlsplit
 
+from .analysis import analyze_manifest, build_summary, findings_html, load_manifest
 
 TEMPLATE = Path(__file__).with_name("report_template.html")
 
@@ -42,7 +43,7 @@ def _view(run, index):
     affinity = effective.get("affinity", [])
     return {
         "index": index,
-        "label": str(run.get("label", "run %d" % (index+1))),
+        "label": str(run.get("label", f"run {index + 1}")),
         "case": str(run.get("case", "unknown")),
         "repetition": run.get("repetition"),
         "status": str(run.get("status", "error")),
@@ -63,8 +64,8 @@ def _view(run, index):
         "wake_p99_ms": _milliseconds(metrics.get("wake_lateness_ns", {}), "p99"),
         "throughput": metrics.get("throughput_jobs_s"),
         "deadline_misses": misses,
-        "miss_percent": miss_fraction*100 if miss_fraction is not None else None,
-        "tail_ratio": p99/p50 if p50 not in (None, 0) and p99 is not None else None,
+        "miss_percent": miss_fraction * 100 if miss_fraction is not None else None,
+        "tail_ratio": p99 / p50 if p50 not in (None, 0) and p99 is not None else None,
         "minor_faults": core.get("minor_faults"),
         "major_faults": core.get("major_faults"),
         "voluntary_cs": core.get("voluntary_cs"),
@@ -76,7 +77,7 @@ def _view(run, index):
 def _number(value, digits=3, suffix=""):
     if value is None:
         return "n/a"
-    return ("%%.%df%%s" % digits) % (value, suffix)
+    return f"{value:.{digits}f}{suffix}"
 
 
 def _run_rows(views):
@@ -84,30 +85,58 @@ def _run_rows(views):
     for run in views:
         label = html.escape(run["label"])
         if run["link"]:
-            label = "<a href='%s'>%s</a>" % (html.escape(run["link"], quote=True), label)
-        scheduler = "%s · nice %s · RT %s · CPU %s" % (
-            run["policy"], run["nice"] if run["nice"] is not None else "n/a",
-            run["priority"] if run["priority"] is not None else "n/a",
-            ",".join(map(str, run["affinity"])) or "n/a")
+            label = f"<a href='{html.escape(run['link'], quote=True)}'>{label}</a>"
+        nice = run["nice"] if run["nice"] is not None else "n/a"
+        priority = run["priority"] if run["priority"] is not None else "n/a"
+        cpus = ",".join(map(str, run["affinity"])) or "n/a"
+        scheduler = f"{run['policy']} · nice {nice} · RT {priority} · CPU {cpus}"
         if run["status"] == "ok" and run["samples"]:
-            misses = "n/a" if run["deadline_misses"] is None else "%d · %.1f%%" % (
-                run["deadline_misses"], run["miss_percent"])
+            misses = (
+                "n/a"
+                if run["deadline_misses"] is None
+                else f"{run['deadline_misses']} · {run['miss_percent']:.1f}%"
+            )
             values = (
-                str(run["samples"]), _number(run["wall_p50_ms"]), _number(run["wall_p99_ms"]),
-                _number(run["wall_max_ms"]), _number(run["response_p99_ms"]),
-                _number(run["wake_p99_ms"]), misses, _number(run["throughput"], 1),
-                html.escape(scheduler))
+                str(run["samples"]),
+                _number(run["wall_p50_ms"]),
+                _number(run["wall_p99_ms"]),
+                _number(run["wall_max_ms"]),
+                _number(run["response_p99_ms"]),
+                _number(run["wake_p99_ms"]),
+                misses,
+                _number(run["throughput"], 1),
+                html.escape(scheduler),
+            )
         elif run["status"] == "ok":
-            values = ("0", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "0.0",
-                      "No jobs started in the measurement window")
+            values = (
+                "0",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                "n/a",
+                "0.0",
+                "No jobs started in the measurement window",
+            )
         else:
-            values = ("—", "—", "—", "—", "—", "—", "—", "—",
-                      html.escape(run["reason"] or "No reason recorded"))
+            values = (
+                "—",
+                "—",
+                "—",
+                "—",
+                "—",
+                "—",
+                "—",
+                "—",
+                html.escape(run["reason"] or "No reason recorded"),
+            )
+        status = html.escape(run["status"])
+        cells = "".join(f"<td>{value}</td>" for value in values)
         rows.append(
-            "<tr data-run-index='%d'><td>%s</td><td><span class='status status-%s'>%s</span></td>"
-            "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
-            "<td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                run["index"], label, html.escape(run["status"]), html.escape(run["status"]), *values))
+            f"<tr data-run-index='{run['index']}'><td>{label}</td>"
+            f"<td><span class='status status-{status}'>{status}</span></td>{cells}</tr>"
+        )
     return "".join(rows)
 
 
@@ -120,8 +149,11 @@ def _repeat_rows(views):
     for case, runs in sorted(groups.items()):
         p99s = [run["wall_p99_ms"] for run in runs]
         maxima = [run["wall_max_ms"] for run in runs]
-        rows.append("<tr><td>%s</td><td>%d</td><td>%.3f</td><td>%.3f–%.3f</td><td>%.3f</td></tr>" % (
-            html.escape(case), len(runs), statistics.median(p99s), min(p99s), max(p99s), max(maxima)))
+        median, low, high, worst = statistics.median(p99s), min(p99s), max(p99s), max(maxima)
+        rows.append(
+            f"<tr><td>{html.escape(case)}</td><td>{len(runs)}</td><td>{median:.3f}</td>"
+            f"<td>{low:.3f}&ndash;{high:.3f}</td><td>{worst:.3f}</td></tr>"
+        )
     return "".join(rows) or "<tr><td colspan='5'>No successful repetitions to summarize.</td></tr>"
 
 
@@ -135,20 +167,35 @@ def _summary(views):
         "RUNS": str(len(views)),
         "SUCCESSFUL": str(len(successful)),
         "P99": _number(statistics.median(run["wall_p99_ms"] for run in measured), 3, " ms")
-               if measured else "n/a",
-        "MISSES": "%d / %d" % (total_misses, periodic_samples) if periodic else "n/a",
+        if measured
+        else "n/a",
+        "MISSES": f"{total_misses} / {periodic_samples}" if periodic else "n/a",
     }
 
 
 def _script_json(value):
-    return (json.dumps(value, separators=(",", ":"), ensure_ascii=False)
-            .replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
-            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+    return (
+        json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 def _render(template, values):
     pattern = re.compile(r"@@([A-Z0-9_]+)@@")
     return pattern.sub(lambda match: values[match.group(1)], template)
+
+
+def _findings(manifest):
+    # A report is written even for interrupted or malformed runs; never let analysis prevent it.
+    try:
+        return findings_html(analyze_manifest(manifest))
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+        reason = html.escape(f"analysis unavailable: {exc}")
+        return f"<li class='caveat'><span class='insight-number'>!</span><div>{reason}</div></li>"
 
 
 def write_report(manifest, path):
@@ -158,16 +205,21 @@ def write_report(manifest, path):
     title = str(manifest.get("title", manifest.get("preset", "Scheduling comparison")))
     summary = _summary(views)
     status = str(manifest.get("status", "comparison"))
+    architecture = system.get("architecture", "unknown architecture")
+    kernel = system.get("kernel", "unknown kernel")
+    host = system.get("hostname", "unknown host")
+    build = build_summary(environment.get("native_build"))
     values = {
         "TITLE": html.escape(title),
         "PAGE_TITLE": html.escape(title + " · Linux scheduling lab"),
         "STATUS": html.escape(status),
-        "STATUS_CLASS": html.escape(status if status in ("ok", "skipped", "error", "interrupted") else "comparison"),
-        "SYSTEM": html.escape("%s · Linux %s · %s" % (
-            system.get("architecture", "unknown architecture"), system.get("kernel", "unknown kernel"),
-            system.get("hostname", "unknown host"))),
+        "STATUS_CLASS": html.escape(
+            status if status in ("ok", "skipped", "error", "interrupted") else "comparison"
+        ),
+        "SYSTEM": html.escape(f"{architecture} · Linux {kernel} · {host} · {build}"),
         "ROWS": _run_rows(views),
         "REPEATS": _repeat_rows(views),
+        "FINDINGS": _findings(manifest),
         "MANIFEST": html.escape(json.dumps(manifest, indent=2, sort_keys=True)),
         "REPORT_DATA": _script_json({"title": title, "status": status, "runs": views}),
         **summary,
@@ -178,20 +230,22 @@ def write_report(manifest, path):
 def compare(paths, output):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    combined = {"schema_version": 1, "preset": "comparison", "runs": [], "sources": [],
-                "title": "Cross-run comparison: verify equivalent parameters, binaries and hardware before attribution."}
+    combined = {
+        "schema_version": 1,
+        "preset": "comparison",
+        "runs": [],
+        "sources": [],
+        "title": (
+            "Cross-run comparison: verify equivalent parameters, binaries and hardware before attribution."
+        ),
+    }
     for index, path in enumerate(paths):
-        source = Path(path)
-        if source.is_dir():
-            source = source / "run.json"
-        manifest = json.loads(source.read_text())
-        if manifest.get("schema_version") != 1:
-            raise ValueError("unsupported manifest schema: %s" % source)
+        source, manifest = load_manifest(path)
         combined["sources"].append({"path": str(source.resolve()), "manifest": manifest})
         for original in manifest["runs"]:
             run = dict(original)
-            run["label"] = "%d: %s" % (index+1, run["label"])
-            run["case"] = "%d: %s" % (index+1, run["case"])
+            run["label"] = f"{index + 1}: {run['label']}"
+            run["case"] = f"{index + 1}: {run['case']}"
             if "artifact_prefix" in run:
                 # Absolute file URI also works when the report moves to a comparison directory.
                 run["artifact_prefix"] = (source.parent / run["artifact_prefix"]).resolve().as_uri()

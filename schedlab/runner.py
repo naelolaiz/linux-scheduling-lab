@@ -12,7 +12,7 @@ import time
 
 from . import __version__
 from .cgroups import Unavailable, cpu_groups
-from .environment import capture, read
+from .environment import capture, read, system_load
 from .metrics import summarize
 from .report import write_report
 
@@ -319,6 +319,7 @@ def run(preset, output, repetitions=3, cpu=None, allow_rt=False, parent=None, la
         manifest["environment_after"] = {
             "cgroup": capture_counters(manifest["environment"]),
             "thermal": {path: read(path) for path in manifest["environment"]["thermal"]},
+            "load": system_load(),
         }
         (output / "run.json").write_text(json.dumps(manifest, indent=2) + "\n")
         write_report(manifest, output / "report.html")

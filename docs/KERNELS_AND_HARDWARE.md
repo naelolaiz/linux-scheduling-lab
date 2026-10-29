@@ -78,7 +78,7 @@ Keep a small experimental notebook in your own results storage:
 | Code | Source commit, dirty changes if any, binary hash and `native_build` (recorded automatically) |
 | Work | Preset/version, passes, jobs, period, number and kind of contenders |
 | Placement | Logical IDs plus physical core/socket/NUMA/capacity relationship |
-| Operating state | AC/battery, cooling, initial temperature, governor/EPP, background services |
+| Operating state | AC/battery, cooling, initial temperature, governor/EPP, background services and builds (the manifest records load and CPU pressure before and after) |
 | Limits | Container/cpuset/ancestor quota, capabilities, RTPRIO/MEMLOCK/RTTIME |
 | Evidence | Raw data, report, sample count/repetitions, tracing or actual XRUN logs if used |
 

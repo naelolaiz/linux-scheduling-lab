@@ -517,6 +517,102 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(bar(1, 80, width=1), "▏")
         self.assertEqual(bar(None, 10), "")
 
+    def test_rt_policies_and_background_cpu_time(self):
+        def audio(policy, p99_ms):
+            return synthetic_run(
+                f"rt-audio-{policy}", policy=policy, mode="audio", response_ns={"p99": p99_ms * 1e6}
+            )
+
+        def background(policy, jobs_s):
+            return synthetic_run(
+                f"rt-background-{policy}", throughput_jobs_s=jobs_s, cpu_total_ns=582e6, elapsed_ns=600e6
+            )
+
+        analysis = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "rt",
+                "runs": [
+                    audio("other", 0.8),
+                    background("other", 1277),
+                    audio("fifo", 0.09),
+                    background("fifo", 1823),
+                    audio("rr", 0.07),
+                    background("rr", 1828),
+                ],
+            }
+        )
+        rt, contender = (finding["text"] for finding in analysis["findings"])
+        self.assertIn("FIFO and RR behave the same", rt)
+        self.assertNotIn("Lowest tail", rt)
+        self.assertIn("97% of a CPU", contender)
+        self.assertIn("speed per CPU-second", contender)
+
+    def test_lowest_tail_only_when_ranges_are_apart(self):
+        def mixed(policy, *p99_ms):
+            return [
+                synthetic_run(
+                    f"mixed-audio-{policy}", repetition, mode="audio", response_ns={"p99": value * 1e6}
+                )
+                for repetition, value in enumerate(p99_ms, 1)
+            ]
+
+        overlapping = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "mixed",
+                "runs": [*mixed("other", 1.0, 2.0), *mixed("idle", 1.5, 2.5)],
+            }
+        )
+        self.assertIn("none is clearly lowest", overlapping["findings"][0]["text"])
+        apart = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "mixed",
+                "runs": [*mixed("other", 2.0, 2.2), *mixed("idle", 1.0, 1.1)],
+            }
+        )
+        self.assertIn("Lowest tail: idle background", apart["findings"][0]["text"])
+
+    def test_busy_machine_and_frequency_caveats(self):
+        def ok(value):
+            return {"status": "ok", "value": value}
+
+        def environment(loadavg):
+            pressure = (
+                "some avg10=30.00 avg60=25.50 avg300=10.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00"
+            )
+            return {
+                "runtime": {"/sys/devices/system/cpu/online": ok("0-15")},
+                "load": {"loadavg": ok(loadavg), "cpu_pressure": ok(pressure)},
+                "cpu_topology": {
+                    "0": {
+                        "cpufreq/scaling_governor": ok("powersave"),
+                        "cpufreq/scaling_driver": ok("amd-pstate-epp"),
+                        "cpufreq/energy_performance_preference": ok("balance_performance"),
+                    }
+                },
+            }
+
+        def caveats(before, after):
+            manifest = {
+                "schema_version": 1,
+                "preset": "quick",
+                "repetitions": 3,
+                "selected_cpu": 0,
+                "environment": environment(before),
+                "environment_after": {"load": environment(after)["load"]},
+                "runs": [],
+            }
+            return analyze_manifest(manifest)["caveats"]
+
+        busy = caveats("9.10 7.00 5.00 17/900 1", "8.00 7.00 5.00 2/900 1")
+        self.assertTrue(any("16 just before and 1 just after" in c and "25.50%" in c for c in busy), busy)
+        self.assertFalse(
+            any("Other work" in c for c in caveats("0.30 0.20 0.10 2/900 1", "0.40 0.20 0.10 3/900 1"))
+        )
+        self.assertTrue(any("driver amd-pstate-epp, EPP balance_performance" in c for c in busy))
+
 
 class EnvironmentTests(unittest.TestCase):
     def test_missing_is_explicit(self):
@@ -536,6 +632,7 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIn("RLIMIT_RTTIME", data["limits"])
         self.assertEqual(len(data["binary_sha256"]), 64)
         self.assertIn("ancestors", data["cgroup"])
+        self.assertIn("loadavg", data["load"])
         self.assertTrue(data["native_build"]["compiler_id"])
         self.assertIn(data["native_build"]["compiler_id"], build_summary(data["native_build"]))
 

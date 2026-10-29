@@ -75,7 +75,8 @@ Existing output directories are never overwritten by `run`.
 [`schedlab analyze`](schedlab/analysis.py) reads saved runs and prints a per-case
 table with a bar plot, preset-aware findings (for example, measured CPU share
 against the kernel's load-weight model in `fairness`, or priority inversion in
-`locks`) and caveats such as too few repetitions or a sanitized build; with
+`locks`) and caveats such as too few repetitions, other work running on the
+machine, or a sanitized build; with
 several runs it compares the same cases and names what differs between them.
 `--format markdown` and `--format json` serve other tools. `run` prints the
 findings when it finishes, and `report.html` shows them too. Every CI run's

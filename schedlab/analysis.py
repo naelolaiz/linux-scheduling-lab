@@ -79,6 +79,7 @@ def run_values(run):
     lock = core.get("lock") or {}
     fraction = metrics.get("miss_fraction")
     cpu_ns = metrics.get("cpu_total_ns")
+    elapsed_ns = metrics.get("elapsed_ns")
     return {
         "response_p50_ms": _milliseconds(metrics, "response_ns", "p50"),
         "response_p99_ms": _milliseconds(metrics, "response_ns", "p99"),
@@ -88,6 +89,8 @@ def run_values(run):
         "miss_percent": fraction * 100 if fraction is not None else None,
         "throughput_jobs_s": metrics.get("throughput_jobs_s"),
         "cpu_ms": cpu_ns / 1e6 if cpu_ns is not None else None,
+        # Fraction of one CPU the measured thread ran during its measurement window.
+        "cpu_share": cpu_ns / elapsed_ns if cpu_ns is not None and elapsed_ns else None,
         "minor_faults": core.get("minor_faults"),
         "involuntary_cs": core.get("involuntary_cs"),
         "high_wait_ms": lock["high_wait_ns"] / 1e6 if lock.get("high_wait_ns") is not None else None,
@@ -161,11 +164,13 @@ def _finding(text, **data):
     return {"text": text, "data": data}
 
 
+def _case(cases, name):
+    return next((summary for summary in cases if summary["case"] == name), None)
+
+
 def _value(cases, case, key):
-    for summary in cases:
-        if summary["case"] == case:
-            return summary["medians"].get(key)
-    return None
+    summary = _case(cases, case)
+    return summary["medians"].get(key) if summary else None
 
 
 def _ms(value):
@@ -177,20 +182,86 @@ def _percent(value):
 
 
 def _periodic_comparison(cases, labelled, intro):
-    """'intro: label p99 (misses), ...' for periodic cases that were measured."""
+    """'intro: label p99 (misses), ...'; names a lowest case only if its range is clearly apart."""
     parts, data = [], {}
     for case, label in labelled:
-        p99 = _value(cases, case, "response_p99_ms")
-        if p99 is None:
+        summary = _case(cases, case)
+        metric = summary["metric"] if summary else None
+        if not metric or metric["key"] != "response_p99_ms":
             continue
-        misses = _value(cases, case, "miss_percent")
-        parts.append(f"{label} {_ms(p99)} ({_percent(misses)} missed)")
-        data[case] = {"response_p99_ms": p99, "miss_percent": misses}
+        misses = summary["medians"].get("miss_percent")
+        parts.append(f"{label} {_ms(metric['median'])} ({_percent(misses)} missed)")
+        data[case] = {"label": label, "median": metric["median"], "min": metric["min"], "max": metric["max"]}
     if len(parts) < 2:
         return []
-    best = min(data, key=lambda case: data[case]["response_p99_ms"])
-    label = dict(labelled)[best]
-    return [_finding(f"{intro}: {'; '.join(parts)}. Lowest tail: {label}.", cases=data)]
+    best = min(data, key=lambda case: data[case]["median"])
+    if all(data[best]["max"] < other["min"] for case, other in data.items() if case != best):
+        verdict = f"Lowest tail: {data[best]['label']}, below the others in every repetition."
+    else:
+        verdict = "Their ranges across repetitions overlap, so none is clearly lowest."
+    return [_finding(f"{intro}: {'; '.join(parts)}. {verdict}", cases=data)]
+
+
+def _rt_audio(_manifest, cases):
+    """RT audio against the SCHED_OTHER case; FIFO and RR only differ between equal-priority RT tasks."""
+    other = _case(cases, "rt-audio-other")
+    base = other["metric"] if other else None
+    measured = {}
+    for policy in ("fifo", "rr"):
+        summary = _case(cases, f"rt-audio-{policy}")
+        if summary and summary["metric"]:
+            measured[policy] = summary
+    if not base or not measured:
+        return []
+    parts = []
+    for policy, summary in measured.items():
+        median = summary["metric"]["median"]
+        ratio = f", {base['median'] / median:.1f}× lower" if median > 0 else ""
+        parts.append(f"{_ms(median)} as {policy}{ratio}")
+    misses = ", ".join(
+        f"{label} {_percent(summary['medians'].get('miss_percent'))}"
+        for label, summary in (("other", other), *measured.items())
+    )
+    return [
+        _finding(
+            f"Against the same SCHED_OTHER background, audio response p99 went from {_ms(base['median'])} "
+            f"as other to {' and '.join(parts)} (deadline misses: {misses}). With a single RT task on the "
+            "CPU, FIFO and RR behave the same; RR only time-slices between RT tasks of equal priority (see "
+            "the sharing preset), so any gap between them here is run-to-run variation.",
+            other_ms=base["median"],
+            rt_ms={policy: summary["metric"]["median"] for policy, summary in measured.items()},
+        )
+    ]
+
+
+def _background(cases, labelled, subject):
+    """The offline contender's throughput beside the CPU time it received, to explain any gap."""
+    rows = []
+    for case, label in labelled:
+        throughput = _value(cases, case, "throughput_jobs_s")
+        share = _value(cases, case, "cpu_share")
+        if throughput is not None and share is not None:
+            rows.append((label, throughput, share))
+    if len(rows) < 2:
+        return []
+    throughputs = [throughput for _, throughput, _ in rows]
+    shares = [share for _, _, share in rows]
+    listed = "; ".join(f"{label} {format_number(t)} jobs/s on {s:.0%} of a CPU" for label, t, s in rows)
+    if min(throughputs) <= 0 or max(throughputs) / min(throughputs) < 1.15:
+        verdict = "its throughput hardly changed."
+    elif min(shares) <= 0 or max(shares) / min(shares) >= 1.1:
+        verdict = "the throughput gap follows the CPU time it received."
+    else:
+        verdict = (
+            "it received about the same CPU time each time, so the gap is speed per CPU-second "
+            "(clock frequency, a busy SMT sibling or caches), not scheduling."
+        )
+    return [
+        _finding(
+            f"Background contender {subject}: {listed}; {verdict}",
+            background={label: {"throughput_jobs_s": t, "cpu_share": s} for label, t, s in rows},
+        )
+    ]
 
 
 def _alone_vs_contended(manifest, cases):
@@ -290,20 +361,22 @@ def _cgroup(manifest, _cases):
                 model_share=model,
             )
         )
+    quotas = {}
     for run in runs:
         requested = str(run["cgroup"]["requested"].get("cpu.max", ""))
         quota, _, period = requested.partition(" ")
         metrics = run.get("metrics") or {}
-        if not quota.isdigit() or not period.isdigit() or not metrics.get("elapsed_ns"):
-            continue
-        used = metrics.get("cpu_total_ns", 0) / metrics["elapsed_ns"]
+        if quota.isdigit() and period.isdigit() and metrics.get("elapsed_ns"):
+            used = metrics.get("cpu_total_ns", 0) / metrics["elapsed_ns"]
+            quotas.setdefault((str(run.get("case")), quota, period), []).append(used)
+    for (case, quota, period), used in quotas.items():
         cap = int(quota) / int(period)
         findings.append(
             _finding(
-                f"{run.get('label')}: cpu.max {quota}/{period} capped the leaf at {cap:.0%} of one CPU; "
-                f"it used {used:.1%}.",
-                label=run.get("label"),
-                used=used,
+                f"{case}: cpu.max {quota}/{period} capped the leaf at {cap:.0%} of one CPU; it used "
+                f"{statistics.median(used):.1%}.",
+                case=case,
+                used=statistics.median(used),
             )
         )
     return findings
@@ -338,7 +411,7 @@ def _sharing(manifest, _cases):
                 f"{policy}: the two equal-priority tasks on one CPU ran back-to-back, {_ms(-overlap)} apart"
             )
             text += (
-                ": FIFO runs each task to completion."
+                ": FIFO runs each task to completion, so their throughput differs only because one ran first."
                 if policy == "fifo"
                 else "; each may have finished within one RR quantum."
             )
@@ -454,7 +527,12 @@ PRESET_FINDINGS = {
             cases,
             [(f"mixed-audio-{p}", f"{p} background") for p in ("other", "batch", "idle")],
             "Audio response p99 by background policy",
-        )
+        ),
+        lambda _m, cases: _background(
+            cases,
+            [(f"mixed-background-{p}", p) for p in ("other", "batch", "idle")],
+            "by its own policy",
+        ),
     ],
     "affinity": [
         lambda _m, cases: _periodic_comparison(
@@ -465,14 +543,23 @@ PRESET_FINDINGS = {
                 ("affinity-two-workers-audio", "two contenders"),
             ],
             "Audio response p99 by placement",
-        )
+        ),
+        lambda _m, cases: _background(
+            cases,
+            [
+                ("affinity-shared-background", "sharing the audio CPU"),
+                ("affinity-separated-background", "on its own CPU"),
+            ],
+            "by placement",
+        ),
     ],
     "rt": [
-        lambda _m, cases: _periodic_comparison(
+        _rt_audio,
+        lambda _m, cases: _background(
             cases,
-            [(f"rt-audio-{p}", p) for p in ("other", "fifo", "rr")],
-            "Audio response p99 against the same background, by audio policy",
-        )
+            [(f"rt-background-{p}", f"audio {p}") for p in ("other", "fifo", "rr")],
+            "by audio policy",
+        ),
     ],
     "sharing": [_sharing],
     "deadline": [_deadline],
@@ -480,6 +567,56 @@ PRESET_FINDINGS = {
     "memory": [_memory],
     "cgroup": [_cgroup],
 }
+
+
+def _read_value(entry):
+    """The value of an environment.read() record, or None when it was unavailable."""
+    return str(entry["value"]) if isinstance(entry, dict) and entry.get("status") == "ok" else None
+
+
+def _online_cpus(environment):
+    """CPUs counted in /proc/loadavg: the online list, falling back to the allowed set."""
+    online = _read_value((environment.get("runtime") or {}).get("/sys/devices/system/cpu/online"))
+    count = 0
+    for part in (online or "").split(","):
+        low, _, high = part.partition("-")
+        if low.isdigit() and (not high or high.isdigit()):
+            count += int(high or low) - int(low) + 1
+    return count or len(environment.get("allowed_cpus") or []) or 1
+
+
+def _runnable_others(load):
+    """Tasks runnable when the snapshot was taken, minus the reader itself (/proc/loadavg field 4)."""
+    fields = (_read_value((load or {}).get("loadavg")) or "").split()
+    running = fields[3].partition("/")[0] if len(fields) > 3 else ""
+    return int(running) - 1 if running.isdigit() else None
+
+
+def _busy_caveats(before, after):
+    """Other work outside the lab, judged when no lab worker runs: just before and after the run."""
+    cpus = _online_cpus(before)
+    threshold = max(2, cpus // 4)
+    counts = [_runnable_others(snapshot.get("load")) for snapshot in (before, after)]
+    if not any(count is not None and count >= threshold for count in counts):
+        return []
+    load = _read_value((before.get("load") or {}).get("loadavg")) or ""
+    pressure = _read_value((before.get("load") or {}).get("cpu_pressure")) or ""
+    some = next((line for line in pressure.splitlines() if line.startswith("some")), "")
+    avg = next((field.partition("=")[2] for field in some.split() if field.startswith("avg60=")), "")
+    context = [f"1-minute load {load.split()[0]}"] if load else []
+    context += [f"CPU pressure {avg}% over the last minute"] if avg else []
+    moments = [
+        f"{count} just {when}"
+        for count, when in zip(counts, ("before", "after"), strict=True)
+        if count is not None
+    ]
+    detail = f" ({'; '.join(context)})" if context else ""
+    return [
+        f"Other work was running: other tasks were runnable on this {cpus}-CPU machine "
+        f"({' and '.join(moments)} the run){detail}. They can share the measured CPU, its SMT sibling "
+        "and the power budget, so tails and throughput describe a busy machine; repeat on an idle one "
+        "before comparing."
+    ]
 
 
 def _caveats(manifest, cases):
@@ -504,23 +641,37 @@ def _caveats(manifest, cases):
             )
         if build.get("build_type") not in OPTIMIZED_BUILDS:
             caveats.append(f"Build type '{build.get('build_type') or 'none'}' is not the optimized default.")
+    caveats.extend(_busy_caveats(environment, manifest.get("environment_after") or {}))
     cpu = manifest.get("selected_cpu")
-    governor = ((environment.get("cpu_topology") or {}).get(str(cpu)) or {}).get("cpufreq/scaling_governor")
-    if (
-        isinstance(governor, dict)
-        and governor.get("status") == "ok"
-        and governor.get("value") != "performance"
-    ):
-        caveats.append(
-            f"CPU {cpu} uses the '{governor['value']}' cpufreq governor: frequency changes add variance."
-        )
-    for case in cases:
-        metric = case["metric"]
-        if metric and case["ok"] > 1 and metric["min"] > 0 and metric["max"] / metric["min"] > 1.5:
-            caveats.append(
-                f"{case['case']}: {metric['label']} varied {metric['max'] / metric['min']:.1f}× across "
-                "repetitions."
+    topology = (environment.get("cpu_topology") or {}).get(str(cpu)) or {}
+    governor = _read_value(topology.get("cpufreq/scaling_governor"))
+    if governor and governor != "performance":
+        details = [
+            f"{label} {value}"
+            for label, value in (
+                ("driver", _read_value(topology.get("cpufreq/scaling_driver"))),
+                ("EPP", _read_value(topology.get("cpufreq/energy_performance_preference"))),
             )
+            if value
+        ]
+        detail = f" ({', '.join(details)})" if details else ""
+        caveats.append(
+            f"CPU {cpu} uses the '{governor}' cpufreq governor{detail}: its clock follows load and power "
+            "limits, which adds run-to-run variance, mostly to throughput."
+        )
+    unstable = [
+        f"{case['case']} {case['metric']['max'] / case['metric']['min']:.1f}×"
+        for case in cases
+        if case["metric"]
+        and case["ok"] > 1
+        and case["metric"]["min"] > 0
+        and case["metric"]["max"] / case["metric"]["min"] > 1.5
+    ]
+    if unstable:
+        caveats.append(
+            f"Primary metric varied by more than 1.5× across repetitions: {', '.join(unstable)}; compare "
+            "these cases by their ranges, not their medians."
+        )
     return caveats
 
 

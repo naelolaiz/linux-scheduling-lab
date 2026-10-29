@@ -87,6 +87,12 @@ the preset's findings and caveats. Give it several run directories to compare th
 same cases across boots, compilers or machines; `--format markdown` and
 `--format json` produce the same analysis for other tools.
 
+Measure on an otherwise idle machine. A package build, browser or indexer shares
+CPUs, SMT siblings and the power budget with the measured task, even when it runs
+at low priority on other CPUs. Each manifest records the load average, the
+runnable-task count and CPU pressure just before and after the run, and the
+analysis warns when other work was runnable.
+
 Open `results/first/report.html` directly in a browser. Its interactive dashboard
 shows the same findings, plus run/status/policy filters, selectable metric
 rankings, latency-tail plots, sortable evidence tables, and dark/light themes. It
@@ -562,7 +568,8 @@ separate opt-in test run on a prepared host; unlike the ordinary suite, it
 requires FIFO/RR and PI to work, not merely skip. `SCHEDLAB_TEST_DEADLINE=1`
 similarly requires DEADLINE admission to succeed. `SCHEDLAB_CGROUP_PARENT=/your/delegation`
 enables delegated CPU-control checks, including leaf cleanup. These are opt-in
-environment variables, never enabled by CI.
+environment variables, never enabled by CI;
+[ADVANCED.md](ADVANCED.md#opt-in-checks-in-containers) runs all three in containers.
 
 `replay` never executes stored shell commands, never inherits RT consent or a
 delegated path, and uses the **current checkout's preset implementation**. Keep the

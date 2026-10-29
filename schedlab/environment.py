@@ -166,6 +166,11 @@ def unified_cgroup():
     return result
 
 
+def system_load():
+    """Load average (with the instantaneous runnable/total task count) and CPU pressure stall info."""
+    return {"loadavg": read("/proc/loadavg"), "cpu_pressure": read("/proc/pressure/cpu")}
+
+
 def native_build(binary):
     """Compiler, flags, sanitizers and libraries that the native binary reports for its own build."""
     try:
@@ -291,6 +296,7 @@ def capture(binary=None):
             str(p): read(p) for p in sorted(Path("/sys/devices/system/node").glob("node*/distance"))
         },
         "cgroup": unified_cgroup(),
+        "load": system_load(),
         "privacy": "Contains hostname, paths, command line and process metadata; review before sharing.",
     }
     if binary:

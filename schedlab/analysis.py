@@ -29,6 +29,7 @@ PRIMARY = {
     "video": ("response_p99_ms", "response p99", "ms", "lower"),
     "offline": ("throughput_jobs_s", "throughput", "jobs/s", "higher"),
     "lock": ("high_wait_ms", "high-priority wait", "ms", "lower"),
+    "load": ("load_percent", "achieved load", "% of its CPUs", None),
 }
 OPTIMIZED_BUILDS = ("Release", "RelWithDebInfo", "MinSizeRel")
 BAR_WIDTH = 24
@@ -72,15 +73,59 @@ def _milliseconds(metrics, name, key):
     return value / 1e6 if value is not None else None
 
 
+def _share(part, whole):
+    """part/whole clamped to [0, 1]; tick-sampled busy time can slightly exceed its window."""
+    if part is None or not whole:
+        return None
+    return min(1.0, max(0.0, part / whole))
+
+
+def contention_values(core):
+    """Runqueue wait and who else used the measured CPU and its SMT siblings, from "contention"."""
+    contention = core.get("contention") or {}
+    if contention.get("status") != "ok":
+        return {"wait_ms": None, "others_share": None, "sibling_busy_share": None}
+    window = contention.get("window_ns")
+    siblings = [_share(busy, window) for busy in contention.get("smt_siblings_busy_ns") or []]
+    siblings = [share for share in siblings if share is not None]
+    wait = contention.get("runqueue_wait_ns")
+    return {
+        "wait_ms": wait / 1e6 if wait is not None else None,
+        "others_share": _share(contention.get("cpu_others_run_ns"), window),
+        "sibling_busy_share": sum(siblings) / len(siblings) if siblings else None,
+    }
+
+
+def load_values(core):
+    """What a sched-load generator achieved: CPU time (its own and its children's) per CPU it used,
+    and for I/O load, which mostly blocks, the rate it wrote."""
+    elapsed_ns = core.get("elapsed_ns") or 0
+    capacity = elapsed_ns * len(core.get("cpus") or [])
+    used = (core.get("cpu_ns") or 0) + (core.get("children_cpu_ns") or 0)
+    work = core.get("work") or {}
+    written = work.get("count") if work.get("unit") == "bytes_written" else None
+    return {
+        "load_percent": 100 * used / capacity if capacity else None,
+        "write_mib_s": written / 2**20 / (elapsed_ns / 1e9) if written is not None and elapsed_ns else None,
+    }
+
+
 def run_values(run):
     """The comparable numbers of one successful run, in display units."""
     metrics = run.get("metrics") or {}
     core = run.get("core") or {}
+    if run.get("role") == "load":
+        return load_values(core)
     lock = core.get("lock") or {}
     fraction = metrics.get("miss_fraction")
     cpu_ns = metrics.get("cpu_total_ns")
     elapsed_ns = metrics.get("elapsed_ns")
+    cpu_share = cpu_ns / elapsed_ns if cpu_ns is not None and elapsed_ns else None
+    throughput = metrics.get("throughput_jobs_s")
     return {
+        **contention_values(core),
+        # Jobs per second of CPU time actually received: separates clock/SMT/cache speed from share.
+        "jobs_per_cpu_s": throughput / cpu_share if throughput is not None and cpu_share else None,
         "response_p50_ms": _milliseconds(metrics, "response_ns", "p50"),
         "response_p99_ms": _milliseconds(metrics, "response_ns", "p99"),
         "response_max_ms": _milliseconds(metrics, "response_ns", "max"),
@@ -90,7 +135,7 @@ def run_values(run):
         "throughput_jobs_s": metrics.get("throughput_jobs_s"),
         "cpu_ms": cpu_ns / 1e6 if cpu_ns is not None else None,
         # Fraction of one CPU the measured thread ran during its measurement window.
-        "cpu_share": cpu_ns / elapsed_ns if cpu_ns is not None and elapsed_ns else None,
+        "cpu_share": cpu_share,
         "minor_faults": core.get("minor_faults"),
         "involuntary_cs": core.get("involuntary_cs"),
         "high_wait_ms": lock["high_wait_ns"] / 1e6 if lock.get("high_wait_ns") is not None else None,
@@ -98,6 +143,8 @@ def run_values(run):
 
 
 def _mode(run):
+    if run.get("role") == "load":
+        return "load"
     core = run.get("core") or {}
     return str(core.get("mode") or (run.get("parameters") or {}).get("mode") or "unknown")
 
@@ -137,11 +184,15 @@ def summarize_cases(manifest):
                     "min": min(present),
                     "max": max(present),
                 }
+        parameters = runs[0].get("parameters") or {}
+        generator = parameters.get("generator") or {}
         cases.append(
             {
                 "case": name,
                 "mode": mode,
-                "policy": effective.get("policy") or (runs[0].get("parameters") or {}).get("policy", "other"),
+                "policy": effective.get("policy")
+                or generator.get("policy")
+                or parameters.get("policy", "other"),
                 "ok": len(ok),
                 "total": len(runs),
                 "statuses": statuses,
@@ -516,6 +567,237 @@ def _periodic_health(_manifest, cases):
     return findings
 
 
+PLACEMENT_TEXT = {
+    "same": "on the measured CPU",
+    "sibling": "on its SMT sibling",
+    "others": "on the other cores",
+    "all": "on every CPU",
+}
+
+
+def _ratio(value, reference):
+    return value / reference if value is not None and reference else None
+
+
+def _generators(manifest):
+    """Generator spec of every load case, in manifest order."""
+    specs = {}
+    for run in manifest.get("runs", []):
+        if run.get("role") == "load":
+            specs.setdefault(str(run.get("case")), (run.get("parameters") or {}).get("generator") or {})
+    return specs
+
+
+def _priority_text(policy, nice):
+    return f"nice {nice}" if policy == "other" else policy.upper()
+
+
+def _scenario_text(generator):
+    priority = _priority_text(generator.get("policy", "other"), generator.get("nice", 0))
+    session = "its own session" if generator.get("session") == "own" else "the lab's session"
+    placement = PLACEMENT_TEXT.get(generator.get("placement"), "")
+    return f"{generator.get('kind')} load {placement} ({priority}, {session})"
+
+
+def _scenarios(manifest, cases):
+    """Each measured case under load beside its idle baseline and what the generator achieved."""
+    rows = []
+    for load_case, generator in _generators(manifest).items():
+        measured = _case(cases, load_case.removesuffix("-load"))
+        baseline = _case(cases, generator.get("baseline", ""))
+        if not measured or not baseline or not measured["metric"] or not baseline["metric"]:
+            continue
+        load = _case(cases, load_case)
+        rows.append(
+            {
+                "measured": measured,
+                "baseline": baseline,
+                "generator": generator,
+                "ratio": _ratio(measured["metric"]["median"], baseline["metric"]["median"]),
+                "speed": _ratio(
+                    measured["medians"].get("jobs_per_cpu_s"), baseline["medians"].get("jobs_per_cpu_s")
+                ),
+                "load_percent": load["medians"].get("load_percent") if load else None,
+                "write_mib_s": load["medians"].get("write_mib_s") if load else None,
+            }
+        )
+    return rows
+
+
+def _versus_baseline(manifest, cases):
+    findings = []
+    for row in _scenarios(manifest, cases):
+        measured, baseline = row["measured"], row["baseline"]
+        metric, now, before = measured["metric"], measured["medians"], baseline["medians"]
+        old, new = format_number(baseline["metric"]["median"]), format_number(metric["median"])
+        change = f"{old} → {new} {metric['unit']}"
+        if row["ratio"] is not None:
+            change += f" ({row['ratio']:.2f}×)"
+        details = []
+        if measured["mode"] in ("audio", "video"):
+            details.append(
+                f"misses {_percent(before.get('miss_percent'))} → {_percent(now.get('miss_percent'))}"
+            )
+        else:
+            if now.get("cpu_share") is not None:
+                details.append(f"it ran {now['cpu_share']:.0%} of the window")
+            if row["speed"] is not None:
+                details.append(f"speed per CPU-second {row['speed']:.2f}×")
+        if now.get("wait_ms") is not None:
+            details.append(f"waited {format_number(now['wait_ms'])} ms for its CPU")
+        if now.get("others_share") is not None:
+            details.append(f"others ran {now['others_share']:.0%} of that CPU")
+        if now.get("sibling_busy_share") is not None and before.get("sibling_busy_share") is not None:
+            details.append(
+                f"SMT sibling busy {before['sibling_busy_share']:.0%} → {now['sibling_busy_share']:.0%}"
+            )
+        if row["write_mib_s"] is not None:
+            details.append(f"the load wrote {format_number(row['write_mib_s'])} MiB/s with fsync")
+        elif row["load_percent"] is not None:
+            details.append(f"the load kept its CPUs {row['load_percent']:.0f}% busy")
+        findings.append(
+            _finding(
+                f"{measured['case']} with {_scenario_text(row['generator'])}: {metric['label']} {change}; "
+                f"{', '.join(details)}.",
+                case=measured["case"],
+                baseline=baseline["case"],
+                ratio=row["ratio"],
+                speed=row["speed"],
+                load_percent=row["load_percent"],
+            )
+        )
+    return findings
+
+
+def _load_audio_summary(manifest, cases):
+    worst = {}
+    for row in _scenarios(manifest, cases):
+        policy = row["measured"]["policy"]
+        if row["ratio"] is not None and (policy not in worst or row["ratio"] > worst[policy]["ratio"]):
+            worst[policy] = row
+    if not worst:
+        return []
+    parts = [
+        f"{policy} audio {row['ratio']:.1f}× under {row['generator'].get('kind')} load"
+        for policy, row in worst.items()
+    ]
+    text = f"Worst response-tail change against its idle baseline: {'; '.join(parts)}."
+    if "fifo" in worst and "other" in worst:
+        text += (
+            " RT priority removes competition for the audio thread's own CPU, but not the SMT, cache, "
+            "memory-bandwidth and clock effects that load on other CPUs still has."
+        )
+    return [_finding(text, worst={policy: row["ratio"] for policy, row in worst.items()})]
+
+
+def _placement_summary(manifest, cases):
+    findings = []
+    for row in _scenarios(manifest, cases):
+        measured, placement = row["measured"], row["generator"].get("placement")
+        others = measured["medians"].get("others_share") or 0
+        wait = measured["medians"].get("wait_ms") or 0
+        if placement in ("sibling", "others") and others > 0.1:
+            # Offline work pays in CPU share; periodic work only pays when it has to wait to run.
+            if measured["mode"] == "offline":
+                cost = f"{others:.0%} of its own CPU"
+            elif wait >= 1:
+                between = f"others ran {others:.0%} of its CPU between jobs"
+                cost = f"{format_number(wait)} ms of runqueue wait ({between})"
+            else:
+                continue
+            findings.append(
+                _finding(
+                    f"Load {PLACEMENT_TEXT[placement]} still cost {measured['case']} {cost}: tasks displaced "
+                    "from the busy CPUs moved onto its CPU.",
+                    case=measured["case"],
+                )
+            )
+        speed, share = row["speed"], measured["medians"].get("cpu_share")
+        if placement == "sibling" and speed is not None and speed < 0.9 and share is not None and share > 0.9:
+            findings.append(
+                _finding(
+                    f"On its SMT sibling the load took no CPU time from {measured['case']} yet cut its speed "
+                    f"to {speed:.2f}× per CPU-second: the two hardware threads share one core.",
+                    case=measured["case"],
+                )
+            )
+    return findings
+
+
+def _priority_summary(manifest, cases):
+    """Offline CPU share against a background thread on its CPU, per priority and session."""
+    shares = {}
+    for row in _scenarios(manifest, cases):
+        generator, measured = row["generator"], row["measured"]
+        if measured["mode"] == "offline" and measured["medians"].get("cpu_share") is not None:
+            key = (generator.get("policy", "other"), generator.get("nice", 0))
+            shares.setdefault(key, {})[generator.get("session", "own")] = measured["medians"]["cpu_share"]
+    if not shares:
+        return []
+    findings = []
+    differences = []
+    for (policy, nice), by_session in shares.items():
+        weights = (load_weight("other", 0), load_weight(policy, nice))
+        model = weights[0] / sum(weights) if None not in weights else None
+        parts = [
+            f"{share:.0%} in {'its own session' if session == 'own' else 'the lab session'}"
+            for session, share in sorted(by_session.items(), reverse=True)
+        ]
+        model_text = f" (load-weight model for one group: {model:.0%})" if model is not None else ""
+        findings.append(
+            _finding(
+                f"Against one CPU-bound thread ({_priority_text(policy, nice)}) on its CPU, offline kept "
+                f"{' and '.join(parts)}{model_text}.",
+                policy=policy,
+                nice=nice,
+                shares=by_session,
+                model_share=model,
+            )
+        )
+        if {"same", "own"} <= by_session.keys():
+            differences.append(abs(by_session["same"] - by_session["own"]))
+    if differences:
+        autogroup = _read_value(
+            ((manifest.get("environment") or {}).get("runtime") or {}).get(
+                "/proc/sys/kernel/sched_autogroup_enabled"
+            )
+        )
+        if max(differences) < 0.05:
+            text = (
+                "The background's session made no difference, so autogroup did not group these tasks "
+                f"(sched_autogroup_enabled={autogroup or 'unknown'}). Autogroup only applies to tasks in "
+                "the root cgroup; under systemd user slices or containers, cgroups decide instead."
+            )
+        else:
+            text = (
+                "Its own session changed the share: with autogroup, each session competes as a group, so a "
+                "background job's nice value no longer ranks it against tasks of other sessions."
+            )
+        findings.append(_finding(text, autogroup=autogroup, largest_difference=max(differences)))
+    return findings
+
+
+def _external(manifest, cases):
+    findings = []
+    for case in cases:
+        medians = case["medians"]
+        if case["mode"] == "load" or medians.get("others_share") is None:
+            continue
+        findings.append(
+            _finding(
+                f"{case['case']}: other work ran {medians['others_share']:.0%} of the measured CPU, "
+                + (
+                    f"its SMT sibling was {medians['sibling_busy_share']:.0%} busy, "
+                    if medians.get("sibling_busy_share") is not None
+                    else ""
+                )
+                + f"and the task waited {format_number(medians.get('wait_ms') or 0)} ms for a CPU.",
+                case=case["case"],
+            )
+        )
+    return findings
+
+
 PRESET_FINDINGS = {
     "quick": [_periodic_health],
     "offline": [_offline],
@@ -566,6 +848,11 @@ PRESET_FINDINGS = {
     "locks": [_locks],
     "memory": [_memory],
     "cgroup": [_cgroup],
+    "load-audio": [_load_audio_summary, _versus_baseline],
+    "load-offline": [_versus_baseline],
+    "load-placement": [_placement_summary, _versus_baseline],
+    "load-priority": [_priority_summary, _versus_baseline],
+    "load-external": [_external],
 }
 
 
@@ -606,16 +893,43 @@ def _busy_caveats(before, after):
     context = [f"1-minute load {load.split()[0]}"] if load else []
     context += [f"CPU pressure {avg}% over the last minute"] if avg else []
     moments = [
-        f"{count} just {when}"
+        f"{count} other {'task was' if count == 1 else 'tasks were'} runnable just {when} the run"
         for count, when in zip(counts, ("before", "after"), strict=True)
         if count is not None
     ]
     detail = f" ({'; '.join(context)})" if context else ""
     return [
-        f"Other work was running: other tasks were runnable on this {cpus}-CPU machine "
-        f"({' and '.join(moments)} the run){detail}. They can share the measured CPU, its SMT sibling "
-        "and the power budget, so tails and throughput describe a busy machine; repeat on an idle one "
-        "before comparing."
+        f"Other work was running on this {cpus}-CPU machine: {' and '.join(moments)}{detail}. It can share "
+        "the measured CPU, its SMT sibling and the power budget, so tails and throughput describe a busy "
+        "machine; repeat on an idle one before comparing."
+    ]
+
+
+def _shared_core_caveats(manifest, cases):
+    """Cases that ran without any lab contender but still met other work on their core."""
+    alone = {
+        str(run.get("case"))
+        for run in manifest.get("runs", [])
+        if run.get("group_cases") == [run.get("case")] and not run.get("load_case")
+    }
+    shared = []
+    for case in cases:
+        if case["case"] not in alone:
+            continue
+        medians, signs = case["medians"], []
+        if medians.get("wait_ms") is not None and medians["wait_ms"] >= 1:
+            signs.append(f"waited {format_number(medians['wait_ms'])} ms")
+        if case["mode"] == "offline" and (medians.get("others_share") or 0) > 0.05:
+            signs.append(f"others ran {medians['others_share']:.0%} of its CPU")
+        if (medians.get("sibling_busy_share") or 0) > 0.3:
+            signs.append(f"its SMT sibling was {medians['sibling_busy_share']:.0%} busy")
+        if signs:
+            shared.append(f"{case['case']} ({', '.join(signs)})")
+    if not shared:
+        return []
+    return [
+        f"Cases meant to run alone met other work on their core: {'; '.join(shared)}. Their numbers include "
+        "that interference, so they are not idle-machine baselines."
     ]
 
 
@@ -642,6 +956,7 @@ def _caveats(manifest, cases):
         if build.get("build_type") not in OPTIMIZED_BUILDS:
             caveats.append(f"Build type '{build.get('build_type') or 'none'}' is not the optimized default.")
     caveats.extend(_busy_caveats(environment, manifest.get("environment_after") or {}))
+    caveats.extend(_shared_core_caveats(manifest, cases))
     cpu = manifest.get("selected_cpu")
     topology = (environment.get("cpu_topology") or {}).get(str(cpu)) or {}
     governor = _read_value(topology.get("cpufreq/scaling_governor"))
@@ -795,7 +1110,9 @@ def _case_rows(analysis):
             if case["ok"] > 1:
                 spread = f"{format_number(metric['min'])}–{format_number(metric['max'])}"
             plot = bar(metric["median"], maxima[metric["key"]])
-            label = f"{metric['label']} ({metric['better']} is better)"
+            label = (
+                f"{metric['label']} ({metric['better']} is better)" if metric["better"] else metric["label"]
+            )
         else:
             label = "not measured" if not case["ok"] else "no primary metric"
         rows.append(
@@ -807,10 +1124,23 @@ def _case_rows(analysis):
                 label,
                 value,
                 spread,
+                contention_text(case["medians"]),
                 plot,
             ]
         )
     return rows
+
+
+def contention_text(medians):
+    """'wait 0.4 ms, others 9%, SMT 99%': runqueue wait, others' share of the CPU, sibling busy share."""
+    parts = []
+    if medians.get("wait_ms") is not None:
+        parts.append(f"wait {format_number(medians['wait_ms'])} ms")
+    if medians.get("others_share") is not None:
+        parts.append(f"others {medians['others_share']:.0%}")
+    if medians.get("sibling_busy_share") is not None:
+        parts.append(f"SMT {medians['sibling_busy_share']:.0%}")
+    return ", ".join(parts)
 
 
 def _headline(analysis):
@@ -838,7 +1168,7 @@ def _text_table(header, rows):
     return lines
 
 
-CASE_HEADER = ["case", "mode", "policy", "ok", "primary metric", "median", "range", ""]
+CASE_HEADER = ["case", "mode", "policy", "ok", "primary metric", "median", "range", "contention", ""]
 
 
 def render_text(result):
@@ -935,9 +1265,9 @@ def _md_run(number, analysis):
         f"{_md(machine)} · {_md(analysis['build'])}",
         "",
         *_md_table(
-            ["Case", "Mode", "Policy", "OK", "Primary metric", "Median", "Range", "Plot"],
+            ["Case", "Mode", "Policy", "OK", "Primary metric", "Median", "Range", "Contention", "Plot"],
             rows,
-            ["---", "---", "---", "--:", "---", "--:", "--:", "---"],
+            ["---", "---", "---", "--:", "---", "--:", "--:", "---", "---"],
         ),
     ]
     for title, items in _notes(analysis):

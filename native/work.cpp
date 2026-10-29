@@ -35,28 +35,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "build_info.hpp"
+#include "common.hpp"
 #include "json.hpp"
 #include "media.hpp"
-
-#if __has_include("build_config.hpp")
-#include "build_config.hpp"
-#else
-// Built without CMake: the compiler and library macros below still identify the toolchain.
-namespace lab::build_config {
-inline constexpr std::string_view compiler_id = "unknown (not built with CMake)";
-inline constexpr std::string_view compiler_version = __VERSION__;
-inline constexpr std::string_view build_type = "unknown";
-inline constexpr std::string_view cxx_flags = "unknown";
-inline constexpr std::string_view linker_flags = "unknown";
-inline constexpr std::string_view sanitize = "unknown";
-inline constexpr std::string_view target_processor = "unknown";
-inline constexpr bool cross_compiled = false;
-} // namespace lab::build_config
-#endif
-
-#ifndef SCHED_DEADLINE
-#define SCHED_DEADLINE 6
-#endif
+#include "options.hpp"
+#include "schedstat.hpp"
 
 // POSIX remains where C++ has no equivalent: CLOCK_MONOTONIC/CLOCK_THREAD_CPUTIME_ID readings and
 // absolute clock_nanosleep releases (shared with the runner's time.monotonic_ns()), fork/waitpid
@@ -64,13 +48,22 @@ inline constexpr bool cross_compiled = false;
 // explicit FIFO attributes around a priority-inheritance mutex (std::thread/std::mutex cannot).
 namespace {
 
-// Exit statuses shared with the Python runner.
-namespace exit_code {
-constexpr int ok = 0;
-constexpr int failure = 1;
-constexpr int invalid = 2;
-constexpr int skipped = 77;
-} // namespace exit_code
+namespace exit_code = lab::exit_code;
+using lab::failure;
+using lab::flush_stdout;
+using lab::interrupted;
+using lab::optional_errno;
+using lab::policy_id;
+using lab::policy_name;
+using lab::read_clock;
+using lab::report_error;
+using lab::report_skip;
+using lab::SchedulingPolicy;
+using lab::sleep_until;
+namespace thread_scheduler = lab::thread_scheduler;
+
+// Keeps the prewarm loop's result observable so the compiler cannot drop the work.
+volatile std::uint32_t prewarm_sink = 0;
 
 constexpr int WIDTH = 160;
 constexpr int HEIGHT = 90;
@@ -79,7 +72,6 @@ constexpr int MAX_SAMPLES = 20000;
 constexpr std::size_t MEMORY_BYTES = std::size_t{16} * 1024 * 1024;
 
 enum class WorkloadMode { offline, audio, video, lock };
-enum class SchedulingPolicy { other, batch, idle, fifo, rr, deadline };
 enum class MemoryStrategy { demand, prefault, locked };
 enum class LockProtocol { none, inherit };
 
@@ -101,6 +93,7 @@ struct Options {
     int deadline_us = 10000;
     int duration_ms = 0;
     int timeout_ms = 8000;
+    int prewarm_ms = 0;
     std::uint64_t start_ns = 0;
 };
 struct Sample {
@@ -157,77 +150,11 @@ struct Effective {
     lab_sched_attr attr{};
     std::uint64_t rr_quantum_ns = 0;
 };
-volatile std::sig_atomic_t interrupted = 0;
-void handle_signal(int signal_number) { interrupted = signal_number; }
-
-// musl leaves the process-oriented sched_* wrappers as ENOSYS stubs.
-// These Linux syscalls deliberately address the current thread (TID 0).
-namespace thread_scheduler {
-int policy() { return static_cast<int>(syscall(SYS_sched_getscheduler, 0)); }
-int parameters(sched_param &param) { return static_cast<int>(syscall(SYS_sched_getparam, 0, &param)); }
-int set(int policy, const sched_param &param) {
-    return static_cast<int>(syscall(SYS_sched_setscheduler, 0, policy, &param));
-}
-} // namespace thread_scheduler
-
-struct ClockReading {
-    std::uint64_t nanoseconds = 0;
-    int error = 0;
-    explicit operator bool() const noexcept { return error == 0; }
-};
-
-ClockReading read_clock(clockid_t clock_id) noexcept {
-    timespec timestamp{};
-    if (clock_gettime(clock_id, &timestamp)) return {.error = errno};
-    return {.nanoseconds = static_cast<std::uint64_t>(timestamp.tv_sec) * 1000000000ULL +
-                           static_cast<std::uint64_t>(timestamp.tv_nsec)};
-}
-int sleep_until(std::uint64_t ns) {
-    const timespec ts = {static_cast<std::time_t>(ns / 1000000000ULL), static_cast<long>(ns % 1000000000ULL)};
-    int rc;
-    do {
-        rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
-    } while (rc == EINTR && !interrupted);
-    return rc;
-}
-
-// The one-line JSON result for runs that produce no measurements.
-int report(std::string_view state, std::string_view reason, int code) {
-    lab::json::Object(std::cout).field("schema_version", 1).field("status", state).field("reason", reason);
-    std::cout << '\n';
-    return code;
-}
-int report_error(std::string_view reason) { return report("error", reason, exit_code::failure); }
-int report_skip(std::string_view reason) { return report("skipped", reason, exit_code::skipped); }
-// A failed system call: unavailable optional capabilities are skips, everything else is an error.
-int failure(std::string_view action, int error, bool optional) {
-    const std::string reason = std::string(action) + ": " + std::generic_category().message(error) + " (" +
-                               std::to_string(error) + ")";
-    return optional ? report_skip(reason) : report_error(reason);
-}
-std::optional<int> number(std::string_view input, long min, long max, std::string_view name) {
-    long n = 0;
-    const auto [end, error] = std::from_chars(input.data(), input.data() + input.size(), n);
-    if (error != std::errc{} || end != input.data() + input.size() || n < min || n > max) {
-        std::cerr << name << " must be in [" << min << ", " << max << "]\n";
-        return std::nullopt;
-    }
-    return static_cast<int>(n);
-}
 std::optional<WorkloadMode> parse_mode(std::string_view value) {
     if (value == "offline") return WorkloadMode::offline;
     if (value == "audio") return WorkloadMode::audio;
     if (value == "video") return WorkloadMode::video;
     if (value == "lock") return WorkloadMode::lock;
-    return std::nullopt;
-}
-std::optional<SchedulingPolicy> parse_policy(std::string_view value) {
-    if (value == "other") return SchedulingPolicy::other;
-    if (value == "batch") return SchedulingPolicy::batch;
-    if (value == "idle") return SchedulingPolicy::idle;
-    if (value == "fifo") return SchedulingPolicy::fifo;
-    if (value == "rr") return SchedulingPolicy::rr;
-    if (value == "deadline") return SchedulingPolicy::deadline;
     return std::nullopt;
 }
 std::optional<MemoryStrategy> parse_memory(std::string_view value) {
@@ -241,34 +168,12 @@ std::optional<LockProtocol> parse_protocol(std::string_view value) {
     if (value == "inherit") return LockProtocol::inherit;
     return std::nullopt;
 }
-int policy_id(SchedulingPolicy policy) {
-    switch (policy) {
-        case SchedulingPolicy::other: return SCHED_OTHER;
-        case SchedulingPolicy::batch: return SCHED_BATCH;
-        case SchedulingPolicy::idle: return SCHED_IDLE;
-        case SchedulingPolicy::fifo: return SCHED_FIFO;
-        case SchedulingPolicy::rr: return SCHED_RR;
-        case SchedulingPolicy::deadline: return SCHED_DEADLINE;
-    }
-    return -1;
-}
 std::string_view mode_name(WorkloadMode mode) {
     switch (mode) {
         case WorkloadMode::offline: return "offline";
         case WorkloadMode::audio: return "audio";
         case WorkloadMode::video: return "video";
         case WorkloadMode::lock: return "lock";
-    }
-    return "unknown";
-}
-std::string_view policy_name(SchedulingPolicy policy) {
-    switch (policy) {
-        case SchedulingPolicy::other: return "other";
-        case SchedulingPolicy::batch: return "batch";
-        case SchedulingPolicy::idle: return "idle";
-        case SchedulingPolicy::fifo: return "fifo";
-        case SchedulingPolicy::rr: return "rr";
-        case SchedulingPolicy::deadline: return "deadline";
     }
     return "unknown";
 }
@@ -283,17 +188,6 @@ std::string_view memory_name(MemoryStrategy memory) {
 std::string_view protocol_name(LockProtocol protocol) {
     return protocol == LockProtocol::inherit ? "inherit" : "none";
 }
-std::string_view policy_name(int p) {
-    switch (p) {
-        case SCHED_OTHER: return "other";
-        case SCHED_BATCH: return "batch";
-        case SCHED_IDLE: return "idle";
-        case SCHED_FIFO: return "fifo";
-        case SCHED_RR: return "rr";
-        case SCHED_DEADLINE: return "deadline";
-        default: return "unknown";
-    }
-}
 void usage() {
     std::cout << "sched-work --output PREFIX [--mode offline|audio|video|lock]\n"
                  "  --policy other|batch|idle|fifo|rr|deadline --nice -20..19\n"
@@ -302,13 +196,14 @@ void usage() {
                  "  --start-ns MONOTONIC_NS --timeout-ms 100..15000\n"
                  "  --allow-rt --priority 1..20 --runtime-us N --deadline-us N\n"
                  "  --memory demand|prefault|mlock --protocol none|inherit\n"
+                 "  --prewarm-ms 0..1000 (busy the CPU before the first release, so it starts at speed)\n"
                  "sched-work --build-info prints the compiler, flags and libraries of this binary.\n"
                  "Values follow the option (--jobs 40) or an equals sign (--jobs=40).\n"
                  "Default: 40 jobs, 4 filter passes, 10ms audio / 30ms video period.\n"
                  "Exit codes: 0 ok, 77 unavailable/permission/safety skip, 2 invalid, 1 failure.\n";
 }
 
-enum class ParseStatus { run, help, build_info, invalid };
+using ParseStatus = lab::options::Status;
 struct ParseResult {
     Options options;
     ParseStatus status = ParseStatus::invalid;
@@ -318,37 +213,15 @@ struct ParseState {
     bool output_set = false;
     bool period_set = false;
 };
-// Each handler validates and stores one option, explaining a rejected value on stderr.
-using OptionHandler = bool (*)(ParseState &state, std::string_view name, std::string_view value);
-struct OptionSpec {
-    std::string_view name;
-    bool takes_value;
-    OptionHandler apply;
-};
-
+using OptionSpec = lab::options::Spec<ParseState>;
 template<auto Member, long Min, long Max>
-bool integer_option(ParseState &state, std::string_view name, std::string_view value) {
-    const auto parsed = number(value, Min, Max, name);
-    if (parsed) state.options.*Member = *parsed;
-    return parsed.has_value();
-}
+constexpr auto integer_option = lab::options::integer<ParseState, Member, Min, Max>;
 template<auto Member, auto Parse>
-bool choice_option(ParseState &state, std::string_view name, std::string_view value) {
-    const auto parsed = Parse(value);
-    if (!parsed) {
-        std::cerr << "invalid " << name << ": " << value << '\n';
-        return false;
-    }
-    state.options.*Member = *parsed;
-    return true;
-}
+constexpr auto choice_option = lab::options::choice<ParseState, Member, Parse>;
+
 bool output_option(ParseState &state, std::string_view /*name*/, std::string_view value) {
     state.options.output = value;
     state.output_set = true;
-    return true;
-}
-bool allow_rt_option(ParseState &state, std::string_view /*name*/, std::string_view /*value*/) {
-    state.options.allow_rt = true;
     return true;
 }
 bool period_option(ParseState &state, std::string_view name, std::string_view value) {
@@ -366,7 +239,7 @@ bool start_option(ParseState &state, std::string_view /*name*/, std::string_view
 
 constexpr std::array option_table{
     OptionSpec{"mode", true, choice_option<&Options::mode, parse_mode>},
-    OptionSpec{"policy", true, choice_option<&Options::policy, parse_policy>},
+    OptionSpec{"policy", true, choice_option<&Options::policy, lab::parse_policy>},
     OptionSpec{"output", true, output_option},
     OptionSpec{"memory", true, choice_option<&Options::memory, parse_memory>},
     OptionSpec{"protocol", true, choice_option<&Options::protocol, parse_protocol>},
@@ -375,54 +248,22 @@ constexpr std::array option_table{
     OptionSpec{"cpu", true, integer_option<&Options::cpu, 0, CPU_SETSIZE - 1>},
     OptionSpec{"nice", true, integer_option<&Options::nice_value, -20, 19>},
     OptionSpec{"priority", true, integer_option<&Options::priority, 1, 20>},
-    OptionSpec{"allow-rt", false, allow_rt_option},
+    OptionSpec{"allow-rt", false, lab::options::flag<ParseState, &Options::allow_rt>},
     OptionSpec{"warmup", true, integer_option<&Options::warmup, 0, 100>},
     OptionSpec{"period-us", true, period_option},
     OptionSpec{"runtime-us", true, integer_option<&Options::runtime_us, 100, 100000>},
     OptionSpec{"deadline-us", true, integer_option<&Options::deadline_us, 1000, 100000>},
     OptionSpec{"duration-ms", true, integer_option<&Options::duration_ms, 0, 10000>},
     OptionSpec{"timeout-ms", true, integer_option<&Options::timeout_ms, 100, 15000>},
+    OptionSpec{"prewarm-ms", true, integer_option<&Options::prewarm_ms, 0, 1000>},
     OptionSpec{"start-ns", true, start_option},
 };
-const OptionSpec *find_option(std::string_view name) {
-    for (const auto &spec : option_table)
-        if (spec.name == name) return &spec;
-    return nullptr;
-}
 
 ParseResult parse(std::span<char *const> args) {
     ParseState state;
     const ParseResult invalid{state.options, ParseStatus::invalid};
-    for (std::size_t index = 1; index < args.size(); index++) {
-        const std::string_view argument = args[index];
-        if (argument == "--help" || argument == "-h") return {state.options, ParseStatus::help};
-        if (argument == "--build-info") return {state.options, ParseStatus::build_info};
-        if (!argument.starts_with("--")) {
-            std::cerr << "unexpected argument: " << argument << '\n';
-            return invalid;
-        }
-        std::string_view name = argument.substr(2);
-        std::optional<std::string_view> attached;
-        if (const auto equals = name.find('='); equals != std::string_view::npos) {
-            attached = name.substr(equals + 1);
-            name = name.substr(0, equals);
-        }
-        const OptionSpec *const spec = find_option(name);
-        if (!spec) {
-            std::cerr << "unrecognized option '--" << name << "'\n";
-            return invalid;
-        }
-        std::string_view value;
-        if (spec->takes_value && attached) {
-            value = *attached;
-        } else if (spec->takes_value && index + 1 < args.size()) {
-            value = args[++index];
-        } else if (spec->takes_value || attached) {
-            std::cerr << "option '--" << name << (attached ? "' takes no value\n" : "' requires a value\n");
-            return invalid;
-        }
-        if (!spec->apply(state, name, value)) return invalid;
-    }
+    if (const auto status = lab::options::parse(args, option_table, state); status != ParseStatus::run)
+        return {state.options, status};
     Options &options = state.options;
     if (!state.period_set && options.mode == WorkloadMode::video) options.period_us = 30000;
     if (!state.output_set) {
@@ -476,9 +317,6 @@ int set_policy(const Options &options) {
     sched_param parameters{};
     if (policy == SCHED_FIFO || policy == SCHED_RR) parameters.sched_priority = options.priority;
     return thread_scheduler::set(policy, parameters);
-}
-bool optional_errno(int e) {
-    return e == EPERM || e == EACCES || e == ENOSYS || e == EBUSY || e == EINVAL || e == ENOTSUP;
 }
 int allocate(buffers &storage, const Options &options) {
     storage.frames = static_cast<std::size_t>(options.period_us) * 48000 / 1000000;
@@ -728,51 +566,9 @@ int read_effective(Effective &effective) {
     }
     return 0;
 }
-std::string standard_library() {
-#ifdef _LIBCPP_VERSION
-    return "libc++ " + std::to_string(_LIBCPP_VERSION);
-#elif defined(__GLIBCXX__)
-    return "libstdc++ " + std::to_string(_GLIBCXX_RELEASE) + " (" + std::to_string(__GLIBCXX__) + ")";
-#else
-    return "unknown";
-#endif
-}
-std::string c_library() {
-#ifdef __GLIBC__
-    return "glibc " + std::to_string(__GLIBC__) + "." + std::to_string(__GLIBC_MINOR__);
-#else
-    return "unknown (not glibc; musl defines no version macro)";
-#endif
-}
-// How this binary was built, so results from different compilers or flags are never conflated.
-void write_build(lab::json::Object &result) {
-    namespace config = lab::build_config;
-    result.object("build")
-        .field("cxx_standard", __cplusplus)
-        .field("compiler", __VERSION__)
-        .field("compiler_id", config::compiler_id)
-        .field("compiler_version", config::compiler_version)
-        .field("build_type", config::build_type)
-        .field("cxx_flags", config::cxx_flags)
-        .field("linker_flags", config::linker_flags)
-        .field("sanitize", config::sanitize)
-        .field("target_processor", config::target_processor)
-        .field("cross_compiled", config::cross_compiled)
-        .field("standard_library", standard_library())
-        .field("libc", c_library());
-}
-int build_info() {
-    {
-        lab::json::Object result(std::cout);
-        result.field("schema_version", 1).field("status", "ok");
-        write_build(result);
-    }
-    std::cout << '\n';
-    return exit_code::ok;
-}
 // The build, requested and effective scheduler sections shared by every successful result.
 void write_scheduler(lab::json::Object &result, const Options &options, const Effective &effective) {
-    write_build(result);
+    lab::write_build(result);
     const bool fixed_priority =
         options.policy == SchedulingPolicy::fifo || options.policy == SchedulingPolicy::rr;
     result.object("requested")
@@ -913,6 +709,24 @@ int worker(const Options &options) {
     const std::uint64_t origin = options.start_ns ? options.start_ns : now + 20000000ULL;
     if (origin < now || origin - now > 2000000000ULL)
         return report_error("start-ns must be in the next two seconds (warmup may have overrun it)");
+    // The contention window opens 2 ms before the first release, so reading counters never delays
+    // the first job and the time before it (including any prewarm) stays outside the window.
+    constexpr std::uint64_t window_lead_ns = 2000000;
+    const std::uint64_t open_at = origin - now > window_lead_ns ? origin - window_lead_ns : now;
+    if (options.prewarm_ms) {
+        // Keep this CPU busy up to the window so the clock does not start from idle.
+        const std::uint64_t prewarm_ns = static_cast<std::uint64_t>(options.prewarm_ms) * 1000000;
+        if (open_at - now > prewarm_ns && sleep_until(open_at - prewarm_ns))
+            return report_error("initial sleep interrupted");
+        std::uint32_t state = 1;
+        for (auto clock = read_clock(CLOCK_MONOTONIC); clock && clock.nanoseconds < open_at && !interrupted;
+             clock = read_clock(CLOCK_MONOTONIC))
+            for (int step = 0; step < 1024; step++) state = state * 1664525U + 1013904223U;
+        prewarm_sink = state;
+    } else if (sleep_until(open_at)) {
+        return report_error("initial sleep interrupted");
+    }
+    lab::schedstat::Window contention(options.cpu, open_at);
     if (sleep_until(origin)) return report_error("initial sleep interrupted");
     rusage before{};
     rusage after{};
@@ -947,6 +761,8 @@ int worker(const Options &options) {
         if (interrupted) return report_error("worker interrupted");
         if (options.duration_ms && sample.finish >= end) break;
     }
+    const auto window_end = read_clock(CLOCK_MONOTONIC);
+    contention.close(window_end ? window_end.nanoseconds : now);
     const bool after_available = getrusage(RUSAGE_SELF, &after) == 0;
     if (!after_available && !rusage_error) rusage_error = errno;
     const bool rusage_available = before_available && after_available;
@@ -986,6 +802,7 @@ int worker(const Options &options) {
             .field("memory", memory_name(options.memory))
             .field("work", options.work)
             .field("warmup", options.warmup);
+        contention.write(result);
         result.object("deadline")
             .field("runtime_us", options.runtime_us)
             .field("deadline_us", options.deadline_us)
@@ -994,19 +811,6 @@ int worker(const Options &options) {
     std::cout << '\n';
     return 0;
 }
-// Reports output errors, including earlier ones the stream has already recorded. std::cout stays
-// synchronized with stdio, so it buffers nothing of its own across fork() and errno reflects the
-// failed write.
-int flush_stdout(int result) {
-    errno = 0;
-    std::cout.flush();
-    if (std::cout) return result;
-    const int output_error = errno ? errno : EIO;
-    std::cerr << "write standard output: " << std::generic_category().message(output_error) << " ("
-              << output_error << ")\n";
-    return result == exit_code::ok ? exit_code::failure : result;
-}
-
 int kill_and_reap(pid_t child) noexcept {
     int first_error = 0;
     if (kill(child, SIGKILL) && errno != ESRCH) first_error = errno;
@@ -1025,7 +829,7 @@ int guarded_run(std::span<char *const> args) {
         usage();
         return flush_stdout(exit_code::ok);
     }
-    if (parsed.status == ParseStatus::build_info) return flush_stdout(build_info());
+    if (parsed.status == ParseStatus::build_info) return lab::print_build_info();
     if (parsed.status == ParseStatus::invalid) return exit_code::invalid;
     const Options &options = parsed.options;
     const int policy = policy_id(options.policy);
@@ -1052,11 +856,7 @@ int guarded_run(std::span<char *const> args) {
         return report_skip("RT requires at least two allowed CPUs for housekeeping");
     if (real_time && policy != SCHED_DEADLINE && options.cpu < 0)
         return report_skip("FIFO/RR require an explicit worker CPU, leaving another for watchdog");
-    struct sigaction action{};
-    action.sa_handler = handle_signal;
-    if (sigemptyset(&action.sa_mask) || sigaction(SIGTERM, &action, nullptr) ||
-        sigaction(SIGINT, &action, nullptr))
-        return failure("install guardian signal handlers", errno, false);
+    if (lab::install_stop_handlers()) return failure("install guardian signal handlers", errno, false);
     // DEADLINE inherits the original domain-wide mask, never the watchdog's pin.
     const pid_t child = fork();
     if (child < 0) return failure("fork guardian", errno, false);

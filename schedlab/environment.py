@@ -166,6 +166,32 @@ def unified_cgroup():
     return result
 
 
+def parse_cpu_list(text):
+    """Kernel CPU list syntax ("0-3,8") -> sorted CPU numbers; malformed parts are ignored."""
+    cpus = set()
+    for part in str(text).strip().split(","):
+        low, _, high = part.partition("-")
+        if low.isdigit() and (not high or high.isdigit()):
+            cpus.update(range(int(low), int(high or low) + 1))
+    return sorted(cpus)
+
+
+def smt_siblings(cpu):
+    """Other hardware threads of `cpu`'s core, empty without SMT or topology information."""
+    siblings = read(Path("/sys/devices/system/cpu") / f"cpu{cpu}" / "topology/thread_siblings_list")
+    return [other for other in parse_cpu_list(siblings.get("value", "")) if other != cpu]
+
+
+def memory_available_mb():
+    """MemAvailable from /proc/meminfo in MiB, or None."""
+    meminfo = read("/proc/meminfo")
+    for line in meminfo.get("value", "").splitlines():
+        name, _, value = line.partition(":")
+        if name == "MemAvailable" and value.split() and value.split()[0].isdigit():
+            return int(value.split()[0]) // 1024
+    return None
+
+
 def system_load():
     """Load average (with the instantaneous runnable/total task count) and CPU pressure stall info."""
     return {"loadavg": read("/proc/loadavg"), "cpu_pressure": read("/proc/pressure/cpu")}

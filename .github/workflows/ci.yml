@@ -23,7 +23,7 @@ jobs:
           - os: ubuntu-24.04-arm
             preset: gcc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       SCHEDLAB_PRESET: ${{ matrix.preset }}
     steps:
@@ -33,7 +33,8 @@ jobs:
         run: uv run --locked poe test
       - name: Example experiments (not a performance gate)
         run: |
-          for preset in quick fairness audio; do
+          presets="quick fairness audio load-audio load-offline load-placement load-priority load-external"
+          for preset in $presets; do
             uv run --locked poe lab run "$preset" --repetitions 3 --out "results/ci/$preset" \
               --label "${{ matrix.os }} · ${{ matrix.preset }} · $preset"
           done

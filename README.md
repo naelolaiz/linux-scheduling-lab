@@ -2,7 +2,8 @@
 
 Learn Linux scheduling by **doing real work and measuring it**: synthesized audio
 DSP, generated video filtering, offline throughput, contention, RT policies,
-priority inversion, page faults and cgroup CPU controls.
+priority inversion, page faults, cgroup CPU controls, and the same work on a
+loaded machine.
 
 Feature references: [Linux scheduling policies](https://man7.org/linux/man-pages/man7/sched.7.html),
 [priority-inheritance mutexes](https://man7.org/linux/man-pages/man3/pthread_mutexattr_setprotocol.3p.html),
@@ -60,8 +61,18 @@ python3 -m schedlab doctor --out results/environment.json
 python3 -m schedlab run fairness --out results/fairness
 python3 -m schedlab run mixed --out results/mixed
 python3 -m schedlab run memory --out results/memory
+python3 -m schedlab run load-placement --out results/load-placement
 python3 -m schedlab --help
 ```
+
+The `load-*` presets repeat audio and offline work against bounded background
+load from [`sched-load`](native/load.cpp): CPU hogs, a desktop's many small
+wakeups, bursts, memory streaming, process churn, pipes, futex handoffs, paced
+`fsync` writes and (opt-in) duty-cycled RT tasks, placed on the measured CPU, its
+SMT sibling, the other cores or everywhere, at different priorities. Each measured
+job records its runqueue wait, the CPU share other tasks took and how busy its
+SMT sibling was, so the analysis can tell scheduling competition from shared
+hardware. `load-external` measures with no generator, while your own workload runs.
 
 Runs contain raw timestamp CSVs, requested/effective scheduler settings,
 [WAV](https://docs.python.org/3/library/wave.html)/[PGM](https://manpages.debian.org/bookworm/netpbm/pgm.5.en.html)
@@ -98,7 +109,7 @@ and [DEADLINE admission/bandwidth rules](https://docs.kernel.org/scheduler/sched
 The lab's [watchdog and opt-in checks](native/work.cpp) are additional safeguards,
 not kernel latency guarantees.
 
-**Requirements:** Linux, CMake 3.21+ (with GNU Make or Ninja), GCC 11+ or Clang 14+
+**Requirements:** Linux, CMake 3.21+ (with GNU Make or Ninja), GCC 11+ or Clang 18+
 with a C++20 standard library (including semaphores), Python 3.10+. Optional: uv
 for the `poe` tasks. The baseline targets Linux 5.4+;
 optional features are detected rather than assumed. glibc and musl are covered

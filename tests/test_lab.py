@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -9,12 +10,12 @@ import unittest
 from unittest.mock import patch
 import wave
 
-from schedlab.analysis import analyze, analyze_manifest, bar, compare_analyses, render
+from schedlab.analysis import analyze, analyze_manifest, bar, compare_analyses, load_values, render
 from schedlab.cgroups import Unavailable, cpu_groups
-from schedlab.environment import capture, kernel_config, native_build, read
+from schedlab.environment import capture, kernel_config, native_build, parse_cpu_list, read
 from schedlab.metrics import distribution, quantile, summarize
 from schedlab.report import build_summary, compare, write_report
-from schedlab.runner import BINARY, NATIVE_DIR, ROOT, cases, run, run_group
+from schedlab.runner import BINARY, LOAD_BINARY, LOAD_KINDS, NATIVE_DIR, ROOT, cases, run, run_group
 
 PIPELINE = NATIVE_DIR / "thread-pipeline"
 
@@ -123,6 +124,23 @@ class NativeTests(unittest.TestCase):
         expected = self.prefix.with_suffix(".pgm").read_bytes()
         self.success("--mode", "video", "--jobs", "1", "--work", "1", "--warmup", "1")
         self.assertEqual(self.prefix.with_suffix(".pgm").read_bytes(), expected)
+
+    def test_prewarm_changes_no_output(self):
+        plain = self.success("--mode", "video", "--jobs", "2", "--cpu", str(self.cpu))
+        frame = self.prefix.with_suffix(".pgm").read_bytes()
+        warm = self.success("--mode", "video", "--jobs", "2", "--cpu", str(self.cpu), "--prewarm-ms", "50")
+        self.assertEqual(warm["checksum"], plain["checksum"])
+        self.assertEqual(self.prefix.with_suffix(".pgm").read_bytes(), frame)
+
+    def test_contention_window(self):
+        contention = self.success("--jobs", "5", "--cpu", str(self.cpu))["contention"]
+        if contention["status"] != "ok":
+            self.skipTest(contention["reason"])
+        self.assertGreater(contention["window_ns"], 0)
+        self.assertGreaterEqual(contention["runqueue_wait_ns"], 0)
+        self.assertEqual(contention["cpu"], self.cpu)
+        self.assertLessEqual(contention["run_ns"], contention["window_ns"])
+        self.assertEqual(len(contention["smt_siblings"]), len(contention["smt_siblings_busy_ns"]))
 
     def test_fault_probe(self):
         demand = self.success("--mode", "audio", "--jobs", "4", "--period-us", "1000", "--memory", "demand")
@@ -607,7 +625,8 @@ class AnalysisTests(unittest.TestCase):
             return analyze_manifest(manifest)["caveats"]
 
         busy = caveats("9.10 7.00 5.00 17/900 1", "8.00 7.00 5.00 2/900 1")
-        self.assertTrue(any("16 just before and 1 just after" in c and "25.50%" in c for c in busy), busy)
+        expected = "16 other tasks were runnable just before the run and 1 other task was runnable just after"
+        self.assertTrue(any(expected in c and "25.50%" in c for c in busy), busy)
         self.assertFalse(
             any("Other work" in c for c in caveats("0.30 0.20 0.10 2/900 1", "0.40 0.20 0.10 3/900 1"))
         )
@@ -704,6 +723,242 @@ class PipelineTests(unittest.TestCase):
             )
         self.assertEqual(output_failure.returncode, 1)
         self.assertIn("standard output", output_failure.stderr)
+
+
+class LoadGeneratorTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.prefix = Path(self.temp.name) / "load"
+        self.cpu = min(os.sched_getaffinity(0))
+
+    def load(self, *args, timeout=18):
+        return subprocess.run([str(LOAD_BINARY), *args], text=True, capture_output=True, timeout=timeout)
+
+    def test_every_kind_does_bounded_work(self):
+        for kind in LOAD_KINDS:
+            with self.subTest(kind=kind):
+                result = self.load(
+                    "--kind",
+                    kind,
+                    "--cpus",
+                    str(self.cpu),
+                    "--max-duration-ms",
+                    "200",
+                    "--output",
+                    str(self.prefix),
+                    "--memory-mb",
+                    "16",
+                    "--io-mb",
+                    "8",
+                    "--io-mb-per-s",
+                    "8",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                data = json.loads(result.stdout)
+                self.assertEqual((data["status"], data["kind"], data["cpus"]), ("ok", kind, [self.cpu]))
+                self.assertGreater(data["work"]["count"], 0)
+                self.assertGreaterEqual(data["elapsed_ns"], 190_000_000)
+                values = load_values(data)
+                self.assertGreater(values["load_percent"], 0)
+                # Only I/O load reports a write rate; it is what that kind is for.
+                if kind == "io":
+                    self.assertGreater(values["write_mib_s"], 0)
+                else:
+                    self.assertIsNone(values["write_mib_s"])
+        self.assertEqual(list(Path(self.temp.name).glob("*.tmp")), [])
+
+    def test_sigterm_stops_and_reports(self):
+        process = subprocess.Popen(
+            [str(LOAD_BINARY), "--kind", "cpu", "--cpus", str(self.cpu)], stdout=subprocess.PIPE, text=True
+        )
+        time.sleep(0.2)
+        begin = time.monotonic()
+        process.send_signal(signal.SIGTERM)
+        stdout, _ = process.communicate(timeout=5)
+        self.assertLess(time.monotonic() - begin, 2)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(json.loads(stdout)["status"], "ok")
+
+    def test_refusals(self):
+        skipped = self.load("--kind", "rt", "--policy", "fifo", "--cpus", str(self.cpu))
+        self.assertEqual(skipped.returncode, 77)
+        self.assertIn("allow-rt", json.loads(skipped.stdout)["reason"])
+        for args in (
+            ("--kind", "cpu", "--policy", "fifo", "--cpus", str(self.cpu)),  # RT only for the rt kind
+            ("--kind", "rt", "--cpus", str(self.cpu)),  # the rt kind needs an RT policy
+            ("--kind", "cpu"),  # no CPUs
+            ("--kind", "io", "--cpus", str(self.cpu)),  # no file prefix
+            ("--kind", "cpu", "--cpus", "1023"),  # outside the allowed mask
+            ("--kind", "cpu", "--cpus", "3-1"),
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(self.load(*args).returncode, 2)
+        self.assertEqual(self.load("--kind", "noop").returncode, 0)
+
+    @unittest.skipUnless(os.environ.get("SCHEDLAB_TEST_RT") == "1", "opt-in RT checks disabled")
+    def test_opt_in_rt_load(self):
+        allowed = sorted(os.sched_getaffinity(0))
+        if len(allowed) < 2:
+            self.skipTest("need two allowed CPUs")
+        result = self.load(
+            "--kind",
+            "rt",
+            "--policy",
+            "fifo",
+            "--priority",
+            "5",
+            "--allow-rt",
+            "--cpus",
+            str(allowed[-1]),
+            "--max-duration-ms",
+            "200",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertGreater(json.loads(result.stdout)["work"]["count"], 0)
+
+
+class LoadScenarioTests(unittest.TestCase):
+    def test_load_case_contract(self):
+        for preset in ("load-audio", "load-offline", "load-placement", "load-priority", "load-external"):
+            for allow_rt, siblings in ((False, []), (True, [1])):
+                with self.subTest(preset=preset, allow_rt=allow_rt):
+                    groups = cases(preset, 0, 2, [0, 1, 2, 3], siblings, allow_rt, 16)
+                    specs = [spec for group in groups for spec in group]
+                    names = [spec["case"] for spec in specs]
+                    self.assertEqual(len(names), len(set(names)))
+                    self.assertLessEqual(max(map(len, groups)), 3)
+                    measured = {
+                        spec["case"] for spec in specs if "generator" not in spec and "skip" not in spec
+                    }
+                    for spec in specs:
+                        generator = spec.get("generator")
+                        if generator:
+                            self.assertIn(generator["baseline"], measured)
+                            self.assertTrue(generator["cpus"])
+                            self.assertTrue(allow_rt or generator["kind"] != "rt")
+                    sibling_skips = [s for s in specs if "skip" in s and "sibling" in s["skip"]]
+                    self.assertEqual(bool(sibling_skips), preset == "load-placement" and not siblings)
+
+    def test_run_group_records_load_and_failures(self):
+        cpu = min(os.sched_getaffinity(0))
+        measured = dict(case="offline", mode="offline", cpu=cpu, jobs=80, work=1, duration_ms=200)
+        generator = dict(kind="cpu", placement="same", cpus=[cpu], baseline="offline-idle", session="own")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = run_group([measured, dict(case="offline-load", generator=generator)], root, 1)
+            work, load = records
+            self.assertEqual(
+                (work["status"], work["load_case"], load["role"], load["status"]),
+                ("ok", "offline-load", "load", "ok"),
+            )
+            self.assertGreater(load_values(load["core"])["load_percent"], 0)
+            broken = dict(generator, cpus=[1023])
+            work, load = run_group([measured, dict(case="offline-load", generator=broken)], root, 2)
+            self.assertEqual((work["status"], load["status"]), ("error", "error"))
+            self.assertIn("load generator", work["reason"])
+            skipped = run_group([dict(case="x", skip="not here")], root, 3)
+            self.assertEqual(skipped[0]["status"], "skipped")
+
+    def test_cpu_lists(self):
+        self.assertEqual(parse_cpu_list("0-2,8"), [0, 1, 2, 8])
+        self.assertEqual(parse_cpu_list(""), [])
+
+
+def load_run(case, baseline, placement="same", policy="other", nice=0, session="own"):
+    generator = dict(
+        kind="cpu",
+        placement=placement,
+        cpus=[1],
+        baseline=baseline,
+        policy=policy,
+        nice=nice,
+        session=session,
+    )
+    return {
+        "case": case,
+        "label": case,
+        "repetition": 1,
+        "status": "ok",
+        "role": "load",
+        "parameters": {"case": case, "generator": generator},
+        "core": {"cpu_ns": 900, "children_cpu_ns": 0, "elapsed_ns": 1000, "cpus": [1]},
+    }
+
+
+def contended_run(case, throughput, share, sibling, wait_ns=0, others_ns=0, load_case=None):
+    run = synthetic_run(
+        case,
+        throughput_jobs_s=throughput,
+        cpu_total_ns=share * 1e9,
+        elapsed_ns=1e9,
+        core={
+            "contention": {
+                "status": "ok",
+                "window_ns": 1e9,
+                "runqueue_wait_ns": wait_ns,
+                "cpu_others_run_ns": others_ns,
+                "smt_siblings_busy_ns": [sibling * 1e9],
+            }
+        },
+    )
+    run["group_cases"] = [case] if load_case is None else [case, load_case]
+    if load_case:
+        run["load_case"] = load_case
+    return run
+
+
+class LoadAnalysisTests(unittest.TestCase):
+    def test_sibling_load_slows_without_taking_cpu_time(self):
+        analysis = analyze_manifest(
+            {
+                "schema_version": 1,
+                "preset": "load-placement",
+                "repetitions": 3,
+                "runs": [
+                    contended_run("offline-idle", 1000, 1.0, 0.0),
+                    contended_run("offline-cpu-sibling", 800, 1.0, 1.0, load_case="offline-cpu-sibling-load"),
+                    load_run("offline-cpu-sibling-load", "offline-idle", placement="sibling"),
+                ],
+            }
+        )
+        texts = [finding["text"] for finding in analysis["findings"]]
+        self.assertTrue(any("cut its speed to 0.80× per CPU-second" in text for text in texts), texts)
+        self.assertTrue(any("SMT sibling busy 0% → 100%" in text for text in texts), texts)
+
+    def test_priority_model_and_session(self):
+        runs = [contended_run("offline-idle", 2000, 1.0, 0.0)]
+        for session, share in (("same", 0.98), ("own", 0.97)):
+            case = f"offline-nice19-{session}"
+            runs += [
+                contended_run(case, 1960, share, 0.0, others_ns=2e7, load_case=case + "-load"),
+                load_run(case + "-load", "offline-idle", nice=19, session=session),
+            ]
+        manifest = {
+            "schema_version": 1,
+            "preset": "load-priority",
+            "repetitions": 3,
+            "runs": runs,
+            "environment": {
+                "runtime": {"/proc/sys/kernel/sched_autogroup_enabled": {"status": "ok", "value": "1"}}
+            },
+        }
+        findings = analyze_manifest(manifest)["findings"]
+        self.assertAlmostEqual(findings[0]["data"]["model_share"], 1024 / (1024 + 15))
+        self.assertIn("made no difference", findings[1]["text"])
+
+    def test_alone_case_sharing_its_core_is_flagged(self):
+        manifest = {
+            "schema_version": 1,
+            "preset": "load-external",
+            "repetitions": 3,
+            "runs": [contended_run("offline", 1000, 0.6, 0.9, wait_ns=4e8, others_ns=4e8)],
+        }
+        analysis = analyze_manifest(manifest)
+        self.assertTrue(
+            any("met other work on their core" in c and "offline" in c for c in analysis["caveats"])
+        )
+        self.assertIn("other work ran 40% of the measured CPU", analysis["findings"][0]["text"])
 
 
 if __name__ == "__main__":

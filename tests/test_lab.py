@@ -10,9 +10,9 @@ from unittest.mock import patch
 import wave
 
 from schedlab.cgroups import Unavailable, cpu_groups
-from schedlab.environment import capture, kernel_config, read
+from schedlab.environment import capture, kernel_config, native_build, read
 from schedlab.metrics import distribution, quantile, summarize
-from schedlab.report import compare, write_report
+from schedlab.report import build_summary, compare, write_report
 from schedlab.runner import BINARY, NATIVE_DIR, ROOT, cases, run, run_group
 
 PIPELINE = NATIVE_DIR / "thread-pipeline"
@@ -163,6 +163,16 @@ class NativeTests(unittest.TestCase):
         result = subprocess.run([str(BINARY), "--help"], text=True, capture_output=True, timeout=18)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Exit codes", result.stdout)
+
+    def test_build_info_matches_results(self):
+        result = subprocess.run([str(BINARY), "--build-info"], text=True, capture_output=True, timeout=18)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build = json.loads(result.stdout)["build"]
+        for key in ("compiler_id", "compiler_version", "build_type", "cxx_flags", "standard_library", "libc"):
+            self.assertIsInstance(build[key], str, key)
+        self.assertGreaterEqual(build["cxx_standard"], 202002)
+        self.assertIsInstance(build["cross_compiled"], bool)
+        self.assertEqual(self.success("--jobs", "1")["build"], build)
 
     def test_rt_never_silently_falls_back(self):
         for policy in ("fifo", "rr", "deadline"):
@@ -398,6 +408,17 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIn("RLIMIT_RTTIME", data["limits"])
         self.assertEqual(len(data["binary_sha256"]), 64)
         self.assertIn("ancestors", data["cgroup"])
+        self.assertTrue(data["native_build"]["compiler_id"])
+        self.assertIn(data["native_build"]["compiler_id"], build_summary(data["native_build"]))
+
+    def test_unreadable_native_build_is_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "not-sched-work"
+            script.write_text(f"#!{sys.executable}\nprint('not json')\n")
+            script.chmod(0o700)
+            build = native_build(script)
+        self.assertEqual(build["status"], "unavailable")
+        self.assertEqual(build_summary(build), "unknown native build")
 
 
 class PipelineTests(unittest.TestCase):

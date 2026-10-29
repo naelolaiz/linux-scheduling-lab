@@ -85,7 +85,7 @@ assets. The directory also contains:
 
 | File | Meaning |
 |---|---|
-| `run.json` | Manifest, environment, commands, results, metrics and structured skips |
+| `run.json` | Manifest, environment (including the native build), commands, results, metrics and structured skips |
 | `*.csv` | Integer monotonic release/start/finish timestamps and thread CPU times |
 | `*.stdout` | Original native JSON result, useful for debugging the parser |
 | `audio-*.wav` | Actual generated, filtered mono PCM audio at 48 kHz |
@@ -514,6 +514,7 @@ The `uv run poe …` forms are optional shortcuts for the plain commands beside 
 | `python3 -m schedlab replay RUN.json --out DIR` | Rerun a validated preset with current code; renew privileged opt-ins |
 | `python3 -m schedlab compare DIR1 DIR2 --out DIR3` | Compare manifests from directories or `run.json` paths |
 | `./build/default/sched-work --help` | Full native option list and bounds |
+| `./build/default/sched-work --build-info` | Compiler, flags, sanitizers and C/C++ libraries of this binary |
 | `./build/default/thread-pipeline --help` | Ordinary-priority C++20 bounded-queue/ownership example |
 
 Example custom unprivileged native run:
@@ -552,8 +553,9 @@ environment variables, never enabled by CI.
 
 `replay` never executes stored shell commands, never inherits RT consent or a
 delegated path, and uses the **current checkout's preset implementation**. Keep the
-same commit, flags and compiler for a controlled comparison, or explicitly record
-that they changed. An unavailable saved CPU requires `--cpu` to remap deliberately.
+same commit, flags and compiler for a controlled comparison; each manifest records
+them (`environment.native_build`, plus the binary hash) so a change is visible.
+An unavailable saved CPU requires `--cpu` to remap deliberately.
 
 Manifests include hostname, process/boot metadata and paths. Review them before
 sharing. Reports load no remote resources. Compare uses links to original CSV

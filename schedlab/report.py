@@ -187,6 +187,19 @@ def _render(template, values):
     return pattern.sub(lambda match: values[match.group(1)], template)
 
 
+def build_summary(build):
+    """One line naming the compiler, build type and any sanitizers of a native build."""
+    if not isinstance(build, dict) or build.get("status") == "unavailable":
+        return "unknown native build"
+    compiler = (
+        f"{build.get('compiler_id', 'compiler')} {build.get('compiler_version', build.get('compiler', ''))}"
+    )
+    parts = [compiler.strip(), build.get("build_type") or "no build type"]
+    if build.get("sanitize"):
+        parts.append(f"sanitize={build['sanitize']}")
+    return " ".join(parts)
+
+
 def write_report(manifest, path):
     views = [_view(run, index) for index, run in enumerate(manifest.get("runs", []))]
     environment = manifest.get("environment", {})
@@ -197,6 +210,7 @@ def write_report(manifest, path):
     architecture = system.get("architecture", "unknown architecture")
     kernel = system.get("kernel", "unknown kernel")
     host = system.get("hostname", "unknown host")
+    build = build_summary(environment.get("native_build"))
     values = {
         "TITLE": html.escape(title),
         "PAGE_TITLE": html.escape(title + " · Linux scheduling lab"),
@@ -204,7 +218,7 @@ def write_report(manifest, path):
         "STATUS_CLASS": html.escape(
             status if status in ("ok", "skipped", "error", "interrupted") else "comparison"
         ),
-        "SYSTEM": html.escape(f"{architecture} · Linux {kernel} · {host}"),
+        "SYSTEM": html.escape(f"{architecture} · Linux {kernel} · {host} · {build}"),
         "ROWS": _run_rows(views),
         "REPEATS": _repeat_rows(views),
         "MANIFEST": html.escape(json.dumps(manifest, indent=2, sort_keys=True)),

@@ -54,15 +54,19 @@ python3 -m schedlab compare results/boot-a-audio results/boot-b-audio \
 ```
 
 Replay reads only a validated preset, repetition count and CPU choice, not saved
-commands. It uses the current implementation; check lab version, source commit
-and binary hash before attributing a difference to the kernel. Privileged consent
+commands. It uses the current implementation; check lab version, source commit,
+binary hash and `environment.native_build` before attributing a difference to the
+kernel. Privileged consent
 must be renewed. On another machine, remap an unavailable CPU with `--cpu N`,
 and explain the physical placement in `--label`.
 
 The manifest records kernel release/version/command line, architecture, identity
 and topology, effective allowed CPUs, config availability, cgroup ancestors,
 limits, CPU-frequency hints, thermals, clocksource and virtualization hints.
-The native JSON records compiler and C++ language version. Raw monotonic timestamps
+Every native result and `environment.native_build` record the build: compiler ID
+and version, build type, compiler and linker flags, sanitizers, target processor,
+and the C++ standard library and libc the binary was compiled against
+(`sched-work --build-info` prints the same). Raw monotonic timestamps
 are meaningful **within a boot/run**; do not subtract timestamps from different
 machines or reboots. Compare durations and distributions instead.
 
@@ -71,7 +75,7 @@ Keep a small experimental notebook in your own results storage:
 | Controlled fact | Record |
 |---|---|
 | Machine/boot | Board or system identifier, kernel commit/package, firmware/microcode |
-| Code | Source commit, dirty changes if any, compiler, flags, binary hash |
+| Code | Source commit, dirty changes if any, binary hash and `native_build` (recorded automatically) |
 | Work | Preset/version, passes, jobs, period, number and kind of contenders |
 | Placement | Logical IDs plus physical core/socket/NUMA/capacity relationship |
 | Operating state | AC/battery, cooling, initial temperature, governor/EPP, background services |

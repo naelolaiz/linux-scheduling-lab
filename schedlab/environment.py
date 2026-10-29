@@ -2,6 +2,7 @@
 
 import gzip
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
@@ -165,6 +166,21 @@ def unified_cgroup():
     return result
 
 
+def native_build(binary):
+    """Compiler, flags, sanitizers and libraries that the native binary reports for its own build."""
+    try:
+        completed = subprocess.run(
+            [str(binary), "--build-info"], capture_output=True, text=True, timeout=5, check=False
+        )
+        data = json.loads(completed.stdout)
+        if completed.returncode == 0 and data.get("status") == "ok" and isinstance(data.get("build"), dict):
+            return data["build"]
+        reason = completed.stderr.strip() or "unexpected --build-info result"
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as exc:
+        reason = str(exc)
+    return {"status": "unavailable", "reason": reason}
+
+
 def capture(binary=None):
     release = platform.release()
     allowed = sorted(os.sched_getaffinity(0))
@@ -279,6 +295,7 @@ def capture(binary=None):
     }
     if binary:
         result["binary_sha256"] = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
+        result["native_build"] = native_build(binary)
     try:
         completed = subprocess.run(
             ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=2, check=False

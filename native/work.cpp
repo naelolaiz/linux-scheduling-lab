@@ -38,6 +38,22 @@
 #include "json.hpp"
 #include "media.hpp"
 
+#if __has_include("build_config.hpp")
+#include "build_config.hpp"
+#else
+// Built without CMake: the compiler and library macros below still identify the toolchain.
+namespace lab::build_config {
+inline constexpr std::string_view compiler_id = "unknown (not built with CMake)";
+inline constexpr std::string_view compiler_version = __VERSION__;
+inline constexpr std::string_view build_type = "unknown";
+inline constexpr std::string_view cxx_flags = "unknown";
+inline constexpr std::string_view linker_flags = "unknown";
+inline constexpr std::string_view sanitize = "unknown";
+inline constexpr std::string_view target_processor = "unknown";
+inline constexpr bool cross_compiled = false;
+} // namespace lab::build_config
+#endif
+
 #ifndef SCHED_DEADLINE
 #define SCHED_DEADLINE 6
 #endif
@@ -286,12 +302,13 @@ void usage() {
                  "  --start-ns MONOTONIC_NS --timeout-ms 100..15000\n"
                  "  --allow-rt --priority 1..20 --runtime-us N --deadline-us N\n"
                  "  --memory demand|prefault|mlock --protocol none|inherit\n"
+                 "sched-work --build-info prints the compiler, flags and libraries of this binary.\n"
                  "Values follow the option (--jobs 40) or an equals sign (--jobs=40).\n"
                  "Default: 40 jobs, 4 filter passes, 10ms audio / 30ms video period.\n"
                  "Exit codes: 0 ok, 77 unavailable/permission/safety skip, 2 invalid, 1 failure.\n";
 }
 
-enum class ParseStatus { run, help, invalid };
+enum class ParseStatus { run, help, build_info, invalid };
 struct ParseResult {
     Options options;
     ParseStatus status = ParseStatus::invalid;
@@ -379,6 +396,7 @@ ParseResult parse(std::span<char *const> args) {
     for (std::size_t index = 1; index < args.size(); index++) {
         const std::string_view argument = args[index];
         if (argument == "--help" || argument == "-h") return {state.options, ParseStatus::help};
+        if (argument == "--build-info") return {state.options, ParseStatus::build_info};
         if (!argument.starts_with("--")) {
             std::cerr << "unexpected argument: " << argument << '\n';
             return invalid;
@@ -710,9 +728,51 @@ int read_effective(Effective &effective) {
     }
     return 0;
 }
+std::string standard_library() {
+#ifdef _LIBCPP_VERSION
+    return "libc++ " + std::to_string(_LIBCPP_VERSION);
+#elif defined(__GLIBCXX__)
+    return "libstdc++ " + std::to_string(_GLIBCXX_RELEASE) + " (" + std::to_string(__GLIBCXX__) + ")";
+#else
+    return "unknown";
+#endif
+}
+std::string c_library() {
+#ifdef __GLIBC__
+    return "glibc " + std::to_string(__GLIBC__) + "." + std::to_string(__GLIBC_MINOR__);
+#else
+    return "unknown (not glibc; musl defines no version macro)";
+#endif
+}
+// How this binary was built, so results from different compilers or flags are never conflated.
+void write_build(lab::json::Object &result) {
+    namespace config = lab::build_config;
+    result.object("build")
+        .field("cxx_standard", __cplusplus)
+        .field("compiler", __VERSION__)
+        .field("compiler_id", config::compiler_id)
+        .field("compiler_version", config::compiler_version)
+        .field("build_type", config::build_type)
+        .field("cxx_flags", config::cxx_flags)
+        .field("linker_flags", config::linker_flags)
+        .field("sanitize", config::sanitize)
+        .field("target_processor", config::target_processor)
+        .field("cross_compiled", config::cross_compiled)
+        .field("standard_library", standard_library())
+        .field("libc", c_library());
+}
+int build_info() {
+    {
+        lab::json::Object result(std::cout);
+        result.field("schema_version", 1).field("status", "ok");
+        write_build(result);
+    }
+    std::cout << '\n';
+    return exit_code::ok;
+}
 // The build, requested and effective scheduler sections shared by every successful result.
 void write_scheduler(lab::json::Object &result, const Options &options, const Effective &effective) {
-    result.object("build").field("cxx_standard", __cplusplus).field("compiler", __VERSION__);
+    write_build(result);
     const bool fixed_priority =
         options.policy == SchedulingPolicy::fifo || options.policy == SchedulingPolicy::rr;
     result.object("requested")
@@ -965,6 +1025,7 @@ int guarded_run(std::span<char *const> args) {
         usage();
         return flush_stdout(exit_code::ok);
     }
+    if (parsed.status == ParseStatus::build_info) return flush_stdout(build_info());
     if (parsed.status == ParseStatus::invalid) return exit_code::invalid;
     const Options &options = parsed.options;
     const int policy = policy_id(options.policy);

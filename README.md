@@ -63,7 +63,8 @@ python3 -m schedlab --help
 
 Runs contain raw timestamp CSVs, requested/effective scheduler settings,
 [WAV](https://docs.python.org/3/library/wave.html)/[PGM](https://manpages.debian.org/bookworm/netpbm/pgm.5.en.html)
-artifacts, environment/config snapshots, per-run statistics and an interactive,
+artifacts, environment/config snapshots, the native build (compiler, flags,
+sanitizers, C/C++ libraries), per-run statistics and an interactive,
 self-contained `report.html`. The dashboard filters by status/policy, ranks any
 latency or throughput metric, compares percentile tails, and needs no server.
 `replay` and `compare` support experiments across kernel boots and machines.

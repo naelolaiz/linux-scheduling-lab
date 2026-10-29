@@ -6,7 +6,7 @@ import sys
 
 from .environment import capture
 from .report import compare, write_report
-from .runner import PRESETS, run
+from .runner import BINARY, PRESETS, run
 
 
 def bounded_repetitions(value):
@@ -53,7 +53,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "doctor":
-            text = json.dumps(capture(), indent=2) + "\n"
+            text = json.dumps(capture(BINARY if BINARY.is_file() else None), indent=2) + "\n"
             if args.out:
                 args.out.write_text(text)
             else:

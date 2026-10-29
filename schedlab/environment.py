@@ -196,7 +196,7 @@ def capture(binary=None):
             )
     cpus = {}
     for cpu in allowed:
-        base = Path("/sys/devices/system/cpu") / ("cpu%d" % cpu)
+        base = Path("/sys/devices/system/cpu") / f"cpu{cpu}"
         files = (
             "topology/physical_package_id",
             "topology/die_id",

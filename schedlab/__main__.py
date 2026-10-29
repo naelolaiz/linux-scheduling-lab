@@ -92,13 +92,13 @@ def main(argv=None):
         states = {
             state: sum(r["status"] == state for r in manifest["runs"]) for state in ("ok", "skipped", "error")
         }
-        print("%s: %s" % (output / "report.html", states))
+        print(f"{output / 'report.html'}: {states}")
         for result in manifest["runs"]:
             if result["status"] != "ok":
-                print("%s: %s: %s" % (result["label"], result["status"], result["reason"]))
+                print(f"{result['label']}: {result['status']}: {result['reason']}")
         return 1 if states["error"] else 0
     except (OSError, ValueError, KeyError) as exc:
-        print("error: %s" % exc, file=sys.stderr)
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("interrupted; started process groups cleaned up", file=sys.stderr)

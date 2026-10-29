@@ -38,12 +38,12 @@ def cpu_groups(parent, controls):
             owned.append(child)
             for name, value in control.items():
                 if name not in ("cpu.weight", "cpu.max"):
-                    raise ValueError("unsupported cgroup control: %s" % name)
+                    raise ValueError(f"unsupported cgroup control: {name}")
                 (child / name).write_text(str(value))
         yield owned
     except OSError as exc:
         if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT, errno.EOPNOTSUPP):
-            raise Unavailable("cgroup delegation unavailable: %s" % exc) from exc
+            raise Unavailable(f"cgroup delegation unavailable: {exc}") from exc
         raise
     finally:
         for child in reversed(owned):

@@ -55,7 +55,7 @@ def run_group(specs, output, repeat, allow_rt=False, binary=BINARY, groups=None,
     deadline = time.monotonic() + timeout
     try:
         for index, spec in enumerate(specs):
-            prefix = "%s-r%d" % (spec["case"], repeat)
+            prefix = f"{spec['case']}-r{repeat}"
             options = {k: v for k, v in spec.items() if k != "case"}
             args = [str(binary), "--output", str(output / prefix), "--start-ns", str(start)]
             for key, value in options.items():
@@ -119,7 +119,7 @@ def run_group(specs, output, repeat, allow_rt=False, binary=BINARY, groups=None,
                     record["reason"] = core["reason"]
             except (ValueError, KeyError, TypeError, OSError) as exc:
                 record.update(
-                    status="error", reason="invalid/incomplete native result: %s" % exc, stdout=stdout
+                    status="error", reason=f"invalid/incomplete native result: {exc}", stdout=stdout
                 )
             results.append(record)
     finally:
@@ -143,8 +143,8 @@ def cases(preset, cpu, other_cpu):
         pairs = (("other", 0), ("other", 10), ("batch", 0), ("idle", 0))
         return [
             [
-                offline("fair-%s-%d-control" % (p, nice), policy="other", duration_ms=500),
-                offline("fair-%s-%d-candidate" % (p, nice), policy=p, nice=nice, duration_ms=500),
+                offline(f"fair-{p}-{nice}-control", policy="other", duration_ms=500),
+                offline(f"fair-{p}-{nice}-candidate", policy=p, nice=nice, duration_ms=500),
             ]
             for p, nice in pairs
         ]
@@ -183,7 +183,7 @@ def cases(preset, cpu, other_cpu):
             for index in range(2):
                 group.append(
                     dict(
-                        case="sharing-%s-%d" % (p, index),
+                        case=f"sharing-{p}-{index}",
                         mode="offline",
                         cpu=cpu,
                         jobs=600,
@@ -234,9 +234,9 @@ def cases(preset, cpu, other_cpu):
 def run(preset, output, repetitions=3, cpu=None, allow_rt=False, parent=None, label=None):
     if not BINARY.is_file():
         raise ValueError(
-            "native binary missing: %s; build it with "
+            f"native binary missing: {BINARY}; build it with "
             "'cmake --preset default && cmake --build --preset default' "
-            "(or 'uv run poe build'), or set SCHEDLAB_NATIVE_DIR" % BINARY
+            "(or 'uv run poe build'), or set SCHEDLAB_NATIVE_DIR"
         )
     allowed = sorted(os.sched_getaffinity(0))
     cpu = allowed[0] if cpu is None else cpu
@@ -282,7 +282,7 @@ def run(preset, output, repetitions=3, cpu=None, allow_rt=False, parent=None, la
                     with cpu_groups(parent, controls) as groups:
                         specs = [
                             dict(
-                                case="cgroup-%s-%d" % (kind, index),
+                                case=f"cgroup-{kind}-{index}",
                                 mode="offline",
                                 cpu=cpu,
                                 duration_ms=600,

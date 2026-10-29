@@ -20,7 +20,7 @@ def main():
                 {
                     "schema_version": 1,
                     "status": "skipped" if skipped else "error",
-                    "reason": "join delegated cgroup: %s" % exc,
+                    "reason": f"join delegated cgroup: {exc}",
                 }
             )
         )

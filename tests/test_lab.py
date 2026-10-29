@@ -305,17 +305,17 @@ class HarnessTests(unittest.TestCase):
             script = root / "hang"
             pidfile = root / "child"
             script.write_text(
-                "#!%s\nimport os,time\nfrom pathlib import Path\n"
+                f"#!{sys.executable}\nimport os,time\nfrom pathlib import Path\n"
                 "pid=os.fork()\n"
-                "if pid == 0:\n Path(%r).write_text(str(os.getpid()))\n"
-                "time.sleep(30)\n" % (sys.executable, str(pidfile))
+                f"if pid == 0:\n Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
+                "time.sleep(30)\n"
             )
             script.chmod(0o700)
             records = run_group([{"case": "hang"}], root, 1, binary=script, timeout=0.3)
             self.assertEqual(records[0]["status"], "error")
             self.assertIn("timeout", records[0]["reason"])
             pid = int(pidfile.read_text())
-            state = Path("/proc/%d/stat" % pid)
+            state = Path(f"/proc/{pid}/stat")
             if state.exists():
                 self.assertEqual(state.read_text().split()[2], "Z")  # Exited; awaiting init reaping.
 
@@ -323,7 +323,7 @@ class HarnessTests(unittest.TestCase):
         from schedlab import __version__
 
         text = (ROOT / "pyproject.toml").read_text()
-        self.assertIn('\nversion = "%s"\n' % __version__, text)
+        self.assertIn(f'\nversion = "{__version__}"\n', text)
 
     def test_cli_invalid(self):
         result = subprocess.run(

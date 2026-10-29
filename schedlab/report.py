@@ -41,7 +41,7 @@ def _view(run, index):
     affinity = effective.get("affinity", [])
     return {
         "index": index,
-        "label": str(run.get("label", "run %d" % (index + 1))),
+        "label": str(run.get("label", f"run {index + 1}")),
         "case": str(run.get("case", "unknown")),
         "repetition": run.get("repetition"),
         "status": str(run.get("status", "error")),
@@ -75,7 +75,7 @@ def _view(run, index):
 def _number(value, digits=3, suffix=""):
     if value is None:
         return "n/a"
-    return ("%%.%df%%s" % digits) % (value, suffix)
+    return f"{value:.{digits}f}{suffix}"
 
 
 def _run_rows(views):
@@ -83,18 +83,16 @@ def _run_rows(views):
     for run in views:
         label = html.escape(run["label"])
         if run["link"]:
-            label = "<a href='%s'>%s</a>" % (html.escape(run["link"], quote=True), label)
-        scheduler = "%s · nice %s · RT %s · CPU %s" % (
-            run["policy"],
-            run["nice"] if run["nice"] is not None else "n/a",
-            run["priority"] if run["priority"] is not None else "n/a",
-            ",".join(map(str, run["affinity"])) or "n/a",
-        )
+            label = f"<a href='{html.escape(run['link'], quote=True)}'>{label}</a>"
+        nice = run["nice"] if run["nice"] is not None else "n/a"
+        priority = run["priority"] if run["priority"] is not None else "n/a"
+        cpus = ",".join(map(str, run["affinity"])) or "n/a"
+        scheduler = f"{run['policy']} · nice {nice} · RT {priority} · CPU {cpus}"
         if run["status"] == "ok" and run["samples"]:
             misses = (
                 "n/a"
                 if run["deadline_misses"] is None
-                else "%d · %.1f%%" % (run["deadline_misses"], run["miss_percent"])
+                else f"{run['deadline_misses']} · {run['miss_percent']:.1f}%"
             )
             values = (
                 str(run["samples"]),
@@ -131,11 +129,11 @@ def _run_rows(views):
                 "—",
                 html.escape(run["reason"] or "No reason recorded"),
             )
+        status = html.escape(run["status"])
+        cells = "".join(f"<td>{value}</td>" for value in values)
         rows.append(
-            "<tr data-run-index='%d'><td>%s</td><td><span class='status status-%s'>%s</span></td>"
-            "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
-            "<td>%s</td><td>%s</td><td>%s</td></tr>"
-            % (run["index"], label, html.escape(run["status"]), html.escape(run["status"]), *values)
+            f"<tr data-run-index='{run['index']}'><td>{label}</td>"
+            f"<td><span class='status status-{status}'>{status}</span></td>{cells}</tr>"
         )
     return "".join(rows)
 
@@ -149,9 +147,10 @@ def _repeat_rows(views):
     for case, runs in sorted(groups.items()):
         p99s = [run["wall_p99_ms"] for run in runs]
         maxima = [run["wall_max_ms"] for run in runs]
+        median, low, high, worst = statistics.median(p99s), min(p99s), max(p99s), max(maxima)
         rows.append(
-            "<tr><td>%s</td><td>%d</td><td>%.3f</td><td>%.3f&ndash;%.3f</td><td>%.3f</td></tr>"
-            % (html.escape(case), len(runs), statistics.median(p99s), min(p99s), max(p99s), max(maxima))
+            f"<tr><td>{html.escape(case)}</td><td>{len(runs)}</td><td>{median:.3f}</td>"
+            f"<td>{low:.3f}&ndash;{high:.3f}</td><td>{worst:.3f}</td></tr>"
         )
     return "".join(rows) or "<tr><td colspan='5'>No successful repetitions to summarize.</td></tr>"
 
@@ -168,7 +167,7 @@ def _summary(views):
         "P99": _number(statistics.median(run["wall_p99_ms"] for run in measured), 3, " ms")
         if measured
         else "n/a",
-        "MISSES": "%d / %d" % (total_misses, periodic_samples) if periodic else "n/a",
+        "MISSES": f"{total_misses} / {periodic_samples}" if periodic else "n/a",
     }
 
 
@@ -195,6 +194,9 @@ def write_report(manifest, path):
     title = str(manifest.get("title", manifest.get("preset", "Scheduling comparison")))
     summary = _summary(views)
     status = str(manifest.get("status", "comparison"))
+    architecture = system.get("architecture", "unknown architecture")
+    kernel = system.get("kernel", "unknown kernel")
+    host = system.get("hostname", "unknown host")
     values = {
         "TITLE": html.escape(title),
         "PAGE_TITLE": html.escape(title + " · Linux scheduling lab"),
@@ -202,14 +204,7 @@ def write_report(manifest, path):
         "STATUS_CLASS": html.escape(
             status if status in ("ok", "skipped", "error", "interrupted") else "comparison"
         ),
-        "SYSTEM": html.escape(
-            "%s · Linux %s · %s"
-            % (
-                system.get("architecture", "unknown architecture"),
-                system.get("kernel", "unknown kernel"),
-                system.get("hostname", "unknown host"),
-            )
-        ),
+        "SYSTEM": html.escape(f"{architecture} · Linux {kernel} · {host}"),
         "ROWS": _run_rows(views),
         "REPEATS": _repeat_rows(views),
         "MANIFEST": html.escape(json.dumps(manifest, indent=2, sort_keys=True)),
@@ -237,12 +232,12 @@ def compare(paths, output):
             source = source / "run.json"
         manifest = json.loads(source.read_text())
         if manifest.get("schema_version") != 1:
-            raise ValueError("unsupported manifest schema: %s" % source)
+            raise ValueError(f"unsupported manifest schema: {source}")
         combined["sources"].append({"path": str(source.resolve()), "manifest": manifest})
         for original in manifest["runs"]:
             run = dict(original)
-            run["label"] = "%d: %s" % (index + 1, run["label"])
-            run["case"] = "%d: %s" % (index + 1, run["case"])
+            run["label"] = f"{index + 1}: {run['label']}"
+            run["case"] = f"{index + 1}: {run['case']}"
             if "artifact_prefix" in run:
                 # Absolute file URI also works when the report moves to a comparison directory.
                 run["artifact_prefix"] = (source.parent / run["artifact_prefix"]).resolve().as_uri()

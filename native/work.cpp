@@ -915,8 +915,10 @@ static int worker(const Options &options) {
     return 0;
 }
 static int flush_stdout(int result) noexcept {
-    if (fflush(stdout) == 0) return result;
-    const int output_error = errno;
+    errno = 0;
+    const int flush_result = fflush(stdout);
+    if (!flush_result && !ferror(stdout)) return result;
+    const int output_error = errno ? errno : EIO;
     fprintf(stderr,"write standard output: %s (%d)\n",strerror(output_error),output_error);
     fflush(stderr);
     return result == 0 ? 1 : result;

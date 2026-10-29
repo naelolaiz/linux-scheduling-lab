@@ -91,7 +91,8 @@ Measure on an otherwise idle machine. A package build, browser or indexer shares
 CPUs, SMT siblings and the power budget with the measured task, even when it runs
 at low priority on other CPUs. Each manifest records the load average, the
 runnable-task count and CPU pressure just before and after the run, and the
-analysis warns when other work was runnable.
+analysis warns when other work was runnable. The
+[loaded-machine lab](#12-lab-a-loaded-machine) measures that effect on purpose.
 
 Open `results/first/report.html` directly in a browser. Its interactive dashboard
 shows the same findings, plus run/status/policy filters, selectable metric
@@ -509,7 +510,108 @@ Current v2 documentation also describes weight/bandwidth callbacks for BPF
 schedulers. Their effect depends on kernel and sched_ext implementation support;
 this does not turn `cpu.weight` or `cpu.max` into FIFO/RR bandwidth controls.
 
-## 12. Command reference and reproducibility
+## 12. Lab: a loaded machine
+
+**Goal/hypothesis:** the same audio or offline job behaves differently on a busy
+desktop, a build server or a machine running other RT work, and *where* and *how*
+the load runs matters as much as how much of it there is.
+
+```sh
+python3 -m schedlab run load-audio --out results/load-audio
+python3 -m schedlab run load-offline --out results/load-offline
+python3 -m schedlab run load-placement --out results/load-placement
+python3 -m schedlab run load-priority --out results/load-priority
+python3 -m schedlab run load-external --label "during a build" --out results/load-external
+```
+
+The background comes from `sched-load`, a bounded generator started before each
+measured group and stopped with SIGTERM after it. It reports what it actually
+achieved (CPU time per CPU and work done), which `schedlab analyze` shows as `load`
+rows. Each kind stands in for a familiar source of load:
+
+| Kind | Stands in for | What it does |
+|---|---|---|
+| `cpu` | Compilers, renderers | One thread per CPU that never sleeps |
+| `wakeups` | A desktop full of daemons, browser tabs and timers | 16 threads per CPU (at most 512), each sleeping 1–20 ms, then doing ~100 µs of work |
+| `bursts` | Build steps, indexers, page loads | Busy for 20–100 ms, idle for 100–500 ms |
+| `memory` | Linkers, data processing | Copies through buffers totalling 10% of available memory (16–256 MiB) |
+| `fork` | Shell scripts, `make` | Spawns and reaps short-lived processes |
+| `pipe` | Shell pipelines, IPC servers | Thread pairs pass one byte back and forth through pipes |
+| `futex` | Thread pools, lock handoffs | Thread pairs hand off through semaphores |
+| `io` | Package installs, logging | 1 MiB writes with `fsync` every 4 MiB, paced at 32 MiB/s in total, to a bounded temporary file in the run directory |
+| `rt` | An audio server or other RT application | FIFO priority 5, busy for half of every 10 ms; only with `--allow-rt`, never on the measured CPU |
+
+The presets combine these with the workloads of the earlier labs; each includes
+its own unloaded baseline:
+
+- `load-audio`: periodic audio (OTHER, plus FIFO priority 10 with `--allow-rt`)
+  against each kind on all allowed CPUs (`rt` only on the other CPUs).
+- `load-offline`: offline frame work against each kind on all allowed CPUs.
+- `load-placement`: `cpu` and `memory` load on the measured CPU (`same`), only on
+  its SMT sibling (`sibling`), on the other cores (`others`) or everywhere (`all`),
+  for audio and offline work. A placement that has no CPUs on this machine is an
+  explicit skip.
+- `load-priority`: one CPU-bound thread on the measured CPU at nice 0, nice 19,
+  BATCH and IDLE, started either in the lab's session or in its own, like a build
+  started from another terminal.
+- `load-external`: no generator. Run it while your own workload (a build, a game,
+  a video call) is active, run it again on an idle machine, and compare the two
+  with `schedlab analyze`.
+
+Every measured workload in these presets keeps its CPU busy for 200 ms before its
+first release (`--prewarm-ms`), so the baseline and the loaded case start at a
+comparable clock frequency.
+
+**Observe:** `schedlab analyze` compares each loaded case with its baseline and adds
+a contention column, measured on the measured CPU while the jobs ran: the thread's
+runqueue wait (from `/proc/thread-self/schedstat`), the share of that CPU that other
+tasks used, and how busy its SMT siblings were (both from `/proc/stat`, sampled at
+the scheduler tick, so a few percent of a short window is noise). They separate two
+ways load hurts:
+
+1. **Scheduling competition:** the wait grows and other tasks take a share of the
+   CPU. That happens with load on the same CPU, and also when load on the other
+   CPUs pushes ordinary tasks onto the measured one.
+2. **Shared hardware:** no wait and no lost share, but each job takes longer per
+   CPU-second. Likely causes are a busy SMT sibling, memory bandwidth, shared
+   caches, or a lower clock under a power limit.
+
+`load-priority` also prints the share the kernel's load weights predict (nice 19
+weighs 15 and IDLE 3, against 1024 at nice 0). It also says whether the
+background's session made a difference. Autogroup only groups tasks in the root
+cgroup, so under systemd user slices or in containers the session usually makes no
+difference, and cgroups decide instead.
+
+**Pros/cons:** each synthetic kind isolates one mechanism, so the cause can be
+named. A real desktop mixes them, which is what `load-external` measures. The
+generator cannot reproduce device interrupts, GPU drivers or thermal history.
+Loaded results vary more than idle ones: use several repetitions and compare
+medians, not single runs. If a baseline already shows runqueue wait or a busy
+sibling, other work was running, and the analysis says so.
+
+All load is bounded: at most 10 s per group, at most 256 MiB of memory, and for
+`io` a 64 MiB file written at about 32 MiB/s and then removed. RT load requires
+`--allow-rt`, runs only on CPUs other than the measured one, leaves at least one
+allowed CPU free of RT load, and has an `RLIMIT_RTTIME` of 200 ms (soft) and
+500 ms (hard). Measured FIFO cases keep the guardian from
+[the FIFO/RR lab](#7-opt-in-lab-fifo-rr-and-equal-priority-sharing).
+
+**Exercise:** pick a CPU whose SMT sibling you know (sysfs
+`cpu/cpuN/topology/thread_siblings_list`) and run `load-placement --cpu N`.
+For offline work, compare `sibling` with `others`. Then run `load-external` once on
+an idle machine and once during a build, and compare the two run directories with
+`schedlab analyze`. To try a single kind by hand,
+`./build/default/sched-load --kind wakeups --cpus 0-3 --max-duration-ms 3000` prints
+the load it achieved.
+
+**Sources and further reading:** [scheduler statistics](https://docs.kernel.org/scheduler/sched-stats.html)
+define `/proc/<pid>/schedstat`; [`proc_stat(5)`](https://man7.org/linux/man-pages/man5/proc_stat.5.html)
+defines the per-CPU time counters; [`sched(7)`](https://man7.org/linux/man-pages/man7/sched.7.html)
+describes autogroup and its cgroup limitation; [CPU topology](https://docs.kernel.org/admin-guide/cputopology.html)
+names SMT siblings. The [generator](../native/load.cpp) and the
+[preset definitions](../schedlab/runner.py) are authoritative for the exact load.
+
+## 13. Command reference and reproducibility
 
 Run commands from the repository root; no Python package installation is needed.
 The `uv run poe …` forms are optional shortcuts for the plain commands beside them.
@@ -534,6 +636,7 @@ The `uv run poe …` forms are optional shortcuts for the plain commands beside 
 | `python3 -m schedlab analyze DIR... [--format text\|markdown\|json] [--out FILE]`, `uv run poe analyze DIR...` | Per-case table and bar plot, preset findings, caveats; several runs add a same-case comparison |
 | `./build/default/sched-work --help` | Full native option list and bounds |
 | `./build/default/sched-work --build-info` | Compiler, flags, sanitizers and C/C++ libraries of this binary |
+| `./build/default/sched-load --help` | Bounded background load generator used by the `load-*` presets |
 | `./build/default/thread-pipeline --help` | Ordinary-priority C++20 bounded-queue/ownership example |
 
 Example custom unprivileged native run:
@@ -550,8 +653,8 @@ Native options: `--mode offline|audio|video|lock`, `--policy other|batch|idle|fi
 `--work 1..128`, `--warmup 0..100`, `--period-us 1000..100000`,
 `--runtime-us 100..100000`, `--deadline-us 1000..100000`,
 `--duration-ms 0..10000` (offline only), `--timeout-ms 100..15000`,
-`--start-ns N`, `--memory demand|prefault|mlock`, `--protocol none|inherit`,
-`--allow-rt`, `--output PREFIX`. A value follows its option (`--jobs 40`) or an
+`--start-ns N`, `--prewarm-ms 0..1000`, `--memory demand|prefault|mlock`,
+`--protocol none|inherit`, `--allow-rt`, `--output PREFIX`. A value follows its option (`--jobs 40`) or an
 equals sign (`--jobs=40`); option names are never abbreviated.
 `--start-ns` is an absolute monotonic common start in the next two seconds after
 setup; omit it for ordinary manual runs. Audio is capped at ten million samples.
@@ -590,7 +693,7 @@ explains process/session handling and timeout behavior; in particular, `preexec_
 is not safe in a multithreaded launcher, which is why this harness remains
 single-threaded.
 
-## 13. Coverage, decisions, troubleshooting
+## 14. Coverage, decisions, troubleshooting
 
 | Topic | Executable automated lab | Opt-in/manual or conceptual boundary |
 |---|---|---|
@@ -602,6 +705,7 @@ single-threaded.
 | Priority inversion/inheritance | locks | POSIX PI support and authorized FIFO threads |
 | Prefault/mlock and page faults | memory | No swap stress; locks only a probe mapping |
 | cgroup weight/quota | cgroup | Explicit CPU delegation; memory/I/O/cpusets manual |
+| Background load: kinds, placement, priority, sessions | load-audio, load-offline, load-placement, load-priority, load-external | Synthetic stand-ins; no device IRQs, GPU or thermal history; RT load opt-in |
 | Kernel and architecture comparison | doctor, replay, compare | Boot/config changes performed separately by an administrator |
 | PREEMPT_RT, IRQ chains, isolation, power, uclamp, sched_ext | Inventory and documented recipes | No global tuning or scheduler loading |
 | Actual XRUNs, cyclictest/rtla, ffmpeg | Not in default suite | Optional hardware/tool-specific experiments |
@@ -627,6 +731,7 @@ single-threaded.
 | Kernel config unknown | `/proc/config.gz` or matching installed config not readable; see kernel guide |
 | cgroup permission/read-only errors | No usable delegation, v1 hierarchy, namespace restrictions; OpenRC itself is not a failure |
 | Unexpected fairness | Autogroups/cgroups, sched_ext, CPU selection, external load, short window |
+| Loaded case faster than its baseline | The baseline met other work (see the caveats), or the load moved other tasks off the measured CPU or kept its clock up |
 | Native affinity-mask error | This build uses libc's `CPU_SETSIZE` mask (normally 1024 CPUs); larger masks are outside native support |
 | Different results across boots | Confirm code, flags, topology, preemption, firmware, governor, thermals and background work |
 
@@ -645,7 +750,7 @@ and [device-XRUN sources](ADVANCED.md#audio-measure-a-real-xrun-do-not-rename-a-
 when diagnosing a particular row. These are decision aids, not additional
 automated workloads or guarantees.
 
-## 14. Implementation and trustworthy sources
+## 15. Implementation and trustworthy sources
 
 `native/work.cpp` uses C++20 vectors/spans/arrays for preallocated buffers, RAII
 for mapped memory and files, atomics and semaphores for setup coordination. Linux/POSIX
@@ -653,7 +758,9 @@ interfaces remain where ISO C++ has no equivalent: scheduler policies,
 absolute clock sleeps, affinity, resource limits and PI mutex attributes. No
 Python executes the measured callbacks. There is deliberately no duplicate C
 engine: the language alone does not change Linux scheduler semantics, and two
-engines would introduce extra differences into comparisons.
+engines would introduce extra differences into comparisons. `native/load.cpp`
+(`sched-load`) shares its option parser, JSON writer, scheduler wrappers and
+build record through the `native/*.hpp` headers.
 
 The policy/getparam/setpolicy wrapper intentionally uses named `SYS_sched_*`
 constants from the target's headers, never architecture-numbered syscalls.
@@ -668,7 +775,8 @@ intended semantics without pretending an unavailable libc call succeeded.
 `schedlab/` contains only standard-library Python: orchestration, read-only
 inspection, metric math, reporting and delegated cgroup lifecycle.
 `tests/` covers output schemas, metrics, option validation, media validity,
-requested/effective settings, faults, skips and watchdog/process-group cleanup.
+requested/effective settings, faults, skips and watchdog/process-group cleanup,
+plus every load kind, generator shutdown and the loaded-machine analysis.
 CI builds/tests GCC and Clang, and tests a static Alpine-built musl native core
 on the host (with the host's Python harness), plus architecture builds. Cross-compilation
 is not native execution and no hosted runner certifies real-time performance.

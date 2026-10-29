@@ -81,7 +81,7 @@ delivery and reaping; neither is a promise of recovery from a kernel/firmware ha
 ## Opt-in checks in containers
 
 The test suite's opt-in checks (`SCHEDLAB_TEST_RT`, `SCHEDLAB_TEST_DEADLINE`,
-`SCHEDLAB_CGROUP_PARENT`; see the [tutorial](TUTORIAL.md#12-command-reference-and-reproducibility))
+`SCHEDLAB_CGROUP_PARENT`; see the [tutorial](TUTORIAL.md#13-command-reference-and-reproducibility))
 also run inside a throwaway container. The container builds from a read-only
 copy of the checkout and is deleted on exit. It shares the host kernel, so the
 real scheduler is exercised. Run these from the repository root on an otherwise
@@ -90,7 +90,8 @@ idle machine; they are commands for you to run, and the lab never invokes sudo.
 **FIFO/RR and priority inheritance, unprivileged.** These need only an RT-priority
 limit. Rootless podman can pass one down when your hard limit allows it
 (`ulimit -Hr` of at least 12, because the lock demo uses priorities 10 to 12). This
-also runs the RT presets and prints their analysis:
+also runs the RT presets and prints their analysis; `load-audio` adds FIFO audio
+and a duty-cycled FIFO background load on the other CPUs:
 
 ```sh
 podman run --rm --ulimit rtprio=12:12 -v "$PWD:/src:ro" docker.io/library/ubuntu:24.04 bash -euc '
@@ -98,8 +99,8 @@ apt-get update -qq && apt-get install -y -qq --no-install-recommends g++ cmake m
 mkdir /tmp/w && tar -C /src --exclude=./build --exclude=./.venv --exclude=./results -cf - . | tar -C /tmp/w -xf -
 cd /tmp/w && cmake --preset default >/dev/null && cmake --build --preset default --parallel >/dev/null
 SCHEDLAB_TEST_RT=1 python3 -m unittest discover -s tests -k opt_in_rt -v
-for preset in rt sharing locks; do python3 -m schedlab run $preset --allow-rt --repetitions 3 --out results/$preset >/dev/null; done
-python3 -m schedlab analyze results/rt results/sharing results/locks'
+for preset in rt sharing locks load-audio; do python3 -m schedlab run $preset --allow-rt --repetitions 3 --out results/$preset >/dev/null; done
+python3 -m schedlab analyze results/rt results/sharing results/locks results/load-audio'
 ```
 
 **DEADLINE and delegated cgroups, as root.** DEADLINE needs `CAP_SYS_NICE` in the

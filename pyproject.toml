@@ -1,0 +1,42 @@
+[project]
+name = "schedlab"
+# Must equal schedlab.__version__ (recorded in manifests); a test checks this.
+version = "1.0.0"
+description = "Measured Linux scheduling labs: C++20 workloads, Python orchestration, offline reports"
+readme = "README.md"
+requires-python = ">=3.10"
+# The lab itself needs only the standard library; `python3 -m schedlab` works without uv.
+dependencies = []
+
+[dependency-groups]
+dev = ["poethepoet>=0.49"]
+
+[tool.uv]
+# A checkout, not an installable package: the runner uses binaries from build/<preset>.
+package = false
+
+# Each task wraps one plain command, so every step also works without uv or poe.
+# Select another CMakePresets.json entry with e.g. SCHEDLAB_PRESET=clang.
+[tool.poe.env]
+SCHEDLAB_PRESET.default = "default"
+SCHEDLAB_NATIVE_DIR.default = "${POE_ROOT}/build/${SCHEDLAB_PRESET}"
+
+[tool.poe.tasks.configure]
+help = "Generate build/$SCHEDLAB_PRESET from CMakePresets.json"
+cmd = "cmake --preset ${SCHEDLAB_PRESET}"
+
+[tool.poe.tasks.build]
+help = "Configure and compile sched-work and thread-pipeline"
+sequence = ["configure", { cmd = "cmake --build --preset ${SCHEDLAB_PRESET} --parallel" }]
+
+[tool.poe.tasks.test]
+help = "Build, then run the unprivileged test suite against that build"
+sequence = ["build", { cmd = "python -m unittest discover -s tests -v" }]
+
+[tool.poe.tasks.lab]
+help = "Run the schedlab CLI against that build, e.g. `poe lab run quick`"
+cmd = "python -m schedlab"
+
+[tool.poe.tasks.clean]
+help = "Remove the native build products of $SCHEDLAB_PRESET (never results/)"
+cmd = "cmake --build --preset ${SCHEDLAB_PRESET} --target clean"

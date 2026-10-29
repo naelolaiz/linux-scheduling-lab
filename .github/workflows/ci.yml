@@ -15,23 +15,26 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            compiler: g++
+            preset: gcc
           - os: ubuntu-24.04
-            compiler: clang++
+            preset: clang
           - os: ubuntu-24.04-arm
-            compiler: g++
+            preset: gcc
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    env:
+      SCHEDLAB_PRESET: ${{ matrix.preset }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: C++20 build and bounded unprivileged tests (native architecture)
-        run: make test CXX=${{ matrix.compiler }}
+        run: uv run --locked poe test
       - name: Produce example report (not a performance gate)
-        run: python3 -m schedlab run quick --repetitions 1 --out results/ci
-      - uses: actions/upload-artifact@v4
+        run: uv run --locked poe lab run quick --repetitions 1 --out results/ci
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: results-${{ matrix.os }}-${{ matrix.compiler }}
+          name: results-${{ matrix.os }}-${{ matrix.preset }}
           path: results/ci/
           retention-days: 7
 
@@ -39,15 +42,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: Build static musl C++20 binary in Alpine
+      - uses: actions/checkout@v7
+      - name: Build static musl C++20 binaries in Alpine (plain CMake)
         run: |
-          docker run --rm -v "$PWD:/src" -w /src alpine:3.20 sh -ec '
-            apk add --no-cache g++ make python3
-            make CXX=g++ LDFLAGS=-static
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.24 sh -ec '
+            apk add --no-cache g++ cmake make
+            cmake --preset static
+            cmake --build --preset static --parallel
           '
-      - name: Test musl core on the host (no container scheduler/seccomp assumptions)
+      - name: Test musl core on the host (no container scheduler/seccomp assumptions; no uv)
         run: python3 -m unittest discover -s tests -v
+        env:
+          SCHEDLAB_NATIVE_DIR: build/static
 
   cross-compile:
     runs-on: ubuntu-24.04
@@ -56,8 +62,10 @@ jobs:
       matrix:
         target: [aarch64-linux-gnu, riscv64-linux-gnu]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install distribution cross toolchain
         run: sudo apt-get update -qq && sudo apt-get install -y g++-${{ matrix.target }}
       - name: Compile only (not native execution or RT validation)
-        run: make CXX=${{ matrix.target }}-g++
+        run: |
+          cmake --preset ${{ matrix.target }}
+          cmake --build --preset ${{ matrix.target }} --parallel

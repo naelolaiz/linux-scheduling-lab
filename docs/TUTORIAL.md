@@ -18,7 +18,8 @@ shutdown, priority selection and a runnable producer/consumer example.
 ## 1. Five-minute safe quickstart
 
 Requirements: GCC 11+ or Clang 14+ with a matching C++20 library including
-`std::binary_semaphore`, GNU Make and Python 3.9+. A glibc or musl Linux
+`std::binary_semaphore`, CMake 3.21+ (its default generator uses GNU Make; Ninja
+also works) and Python 3.10+. A glibc or musl Linux
 installation is supported. Linux 5.4+ is the baseline; optional interfaces depend
 on the actual kernel build and permissions. This is not a promise that every
 custom kernel exposes every feature.
@@ -28,34 +29,47 @@ These are **manual setup examples**, not commands the lab executes:
 
 | Distribution | Packages / manual command |
 |---|---|
-| [Gentoo / Portage](https://wiki.gentoo.org/wiki/Handbook:AMD64/Working/Portage), including OpenRC | `emerge --ask sys-devel/gcc dev-build/make dev-lang/python` |
-| [Debian / Ubuntu apt](https://manpages.debian.org/bookworm/apt/apt.8.en.html) | `apt install g++ make python3` |
-| [Fedora / DNF](https://dnf.readthedocs.io/en/latest/command_ref.html) | `dnf install gcc-c++ make python3` |
-| [Alpine / apk](https://docs.alpinelinux.org/user-handbook/0.1a/Working/apk.html), musl | `apk add g++ make python3` |
+| [Gentoo / Portage](https://wiki.gentoo.org/wiki/Handbook:AMD64/Working/Portage), including OpenRC | `emerge --ask sys-devel/gcc dev-build/cmake dev-build/make dev-lang/python` |
+| [Debian / Ubuntu apt](https://manpages.debian.org/bookworm/apt/apt.8.en.html) | `apt install g++ cmake make python3` |
+| [Fedora / DNF](https://dnf.readthedocs.io/en/latest/command_ref.html) | `dnf install gcc-c++ cmake make python3` |
+| [Alpine / apk](https://docs.alpinelinux.org/user-handbook/0.1a/Working/apk.html), musl | `apk add g++ cmake make python3` |
+
+Optionally [install uv](https://docs.astral.sh/uv/getting-started/installation/)
+to use the `uv run poe …` shortcuts; each one runs a command shown in this
+tutorial, and nothing else about the lab changes.
 
 Gentoo's selected compiler must support C++20; `g++ --version` and
 `python3 --version` show what the current shell actually uses. No OpenRC service
-needs to be started. Use `make CXX=clang++` to choose Clang, or specify your
-cross-toolchain's C++ compiler. When changing compiler/flags, run `make clean`
-first so the binary is rebuilt.
+needs to be started. Each [CMake preset](../CMakePresets.json) builds into its
+own `build/<preset>` directory: `default` uses `CXX` or the system `c++`, `gcc`
+and `clang` select a compiler, and the cross presets show how to name a
+cross-toolchain compiler. Changing flags (for example
+`cmake --preset default -DCMAKE_CXX_FLAGS=-fno-omit-frame-pointer`) rebuilds the
+affected programs on the next build; no clean step is needed. To test or run the
+lab against another build, set `SCHEDLAB_NATIVE_DIR=build/<preset>`; the `poe`
+tasks derive it from `SCHEDLAB_PRESET=<preset>`.
 
 **Build/setup sources:** [GCC](https://gcc.gnu.org/projects/cxx-status.html#cxx20),
 [Clang](https://clang.llvm.org/cxx_status.html#cxx20) and
 [libstdc++ library support](https://gcc.gnu.org/onlinedocs/libstdc++/manual/status.html)
 distinguish compiler features from library availability.
-[Make variable overrides](https://www.gnu.org/software/make/manual/html_node/Overriding.html),
+[CMake presets](https://cmake.org/cmake/help/latest/manual/cmake-presets.7.html),
 [Gentoo's compiler setup](https://wiki.gentoo.org/wiki/GCC) and
-[OpenRC](https://wiki.gentoo.org/wiki/OpenRC) explain the corresponding tools.
+[OpenRC](https://wiki.gentoo.org/wiki/OpenRC) explain the corresponding tools;
+[uv projects](https://docs.astral.sh/uv/concepts/projects/) and
+[Poe the Poet](https://poethepoet.natn.io/) document the optional task wrappers.
 The stated minima are compatibility targets, not vendor support guarantees;
 prefer maintained releases (see [Python version status](https://devguide.python.org/versions/)).
 
 From the repository root:
 
 ```sh
-make
-make test
+cmake --preset default && cmake --build --preset default
+python3 -m unittest discover -s tests -v
 python3 -m schedlab run quick --repetitions 1 --out results/first
 ```
+
+With uv, `uv run poe test` performs the first two steps.
 
 Open `results/first/report.html` directly in a browser. Its interactive dashboard
 has run/status/policy filters, selectable metric rankings, latency-tail plots,
@@ -78,7 +92,8 @@ the measured native loops synthesize and filter samples or generate and blur pix
 `results/first` must not already exist. Choose a new name for each run. Default
 automatically named directories include a timestamp. No background service remains.
 Cleanup means removing **only your chosen run directory**, using your usual file
-manager. `make clean` removes just the native build product, not results.
+manager. `cmake --build --preset default --target clean` (or `uv run poe clean`)
+removes just the native build products, not results.
 
 **Artifact sources:** the lab's [PCM WAV serializer](../native/media.hpp),
 Python's [WAV inspection API](https://docs.python.org/3/library/wave.html), and
@@ -472,12 +487,14 @@ this does not turn `cpu.weight` or `cpu.max` into FIFO/RR bandwidth controls.
 ## 12. Command reference and reproducibility
 
 Run commands from the repository root; no Python package installation is needed.
+The `uv run poe …` forms are optional shortcuts for the plain commands beside them.
 
 | Command | Purpose |
 |---|---|
-| `make`, `make CXX=clang++` | Native C++20 build |
-| `make test` / `make check` | Unprivileged correctness/integration tests |
-| `make clean` | Remove the built native executable |
+| `cmake --preset P && cmake --build --preset P`, `uv run poe build` | Native C++20 build in `build/P`; presets `default`, `gcc`, `clang`, `static` and cross targets |
+| `python3 -m unittest discover -s tests -v`, `uv run poe test` | Unprivileged correctness/integration tests (`poe test` builds first) |
+| `cmake --build --preset P --target clean`, `uv run poe clean` | Remove the built native executables |
+| `SCHEDLAB_NATIVE_DIR=build/P`, `SCHEDLAB_PRESET=P` | Use a non-default build for tests and runs (the latter for `poe` tasks) |
 | `python3 -m schedlab doctor [--out FILE]` | Read-only inventory; unknown/unreadable facts remain explicit |
 | `python3 -m schedlab run PRESET` | Run any preset from `--help`; generate a fresh result directory |
 | `--repetitions N` | 1..10 repetitions, default 3 |
@@ -487,14 +504,14 @@ Run commands from the repository root; no Python package installation is needed.
 | `python3 -m schedlab report RUN.json --out FILE.html` | Rebuild a report from saved results |
 | `python3 -m schedlab replay RUN.json --out DIR` | Rerun a validated preset with current code; renew privileged opt-ins |
 | `python3 -m schedlab compare DIR1 DIR2 --out DIR3` | Compare manifests from directories or `run.json` paths |
-| `./build/sched-work --help` | Full native option list and bounds |
-| `./build/thread-pipeline --help` | Ordinary-priority C++20 bounded-queue/ownership example |
+| `./build/default/sched-work --help` | Full native option list and bounds |
+| `./build/default/thread-pipeline --help` | Ordinary-priority C++20 bounded-queue/ownership example |
 
 Example custom unprivileged native run:
 
 ```sh
 mkdir -p results/custom
-./build/sched-work --mode audio --policy other --jobs 100 --work 16 \
+./build/default/sched-work --mode audio --policy other --jobs 100 --work 16 \
   --period-us 10000 --memory prefault --output results/custom/audio \
   > results/custom/audio.json
 ```
@@ -515,12 +532,13 @@ the Python runner prevents accidental reuse of a whole run directory.
 Native exit status: 0 success, 77 unsupported/permission/safety skip, 2 invalid
 input, 1 actual failure. The harness returns 1 for any failed run, but 0 for an
 honestly skipped capability. Check the printed counts or manifest when automation
-requires every optional feature. `SCHEDLAB_TEST_RT=1 make test` is a separate
-opt-in test run on a prepared host; unlike the ordinary suite, it requires FIFO/RR
-and PI to work, not merely skip. `SCHEDLAB_TEST_DEADLINE=1 make test` similarly
-requires DEADLINE admission to succeed. `SCHEDLAB_CGROUP_PARENT=/your/delegation
-make test` enables delegated CPU-control checks, including leaf cleanup. These
-are opt-in environment variables, never enabled by CI.
+requires every optional feature. Prefixing the test command (`uv run poe test` or
+`python3 -m unittest discover -s tests -v`) with `SCHEDLAB_TEST_RT=1` makes a
+separate opt-in test run on a prepared host; unlike the ordinary suite, it
+requires FIFO/RR and PI to work, not merely skip. `SCHEDLAB_TEST_DEADLINE=1`
+similarly requires DEADLINE admission to succeed. `SCHEDLAB_CGROUP_PARENT=/your/delegation`
+enables delegated CPU-control checks, including leaf cleanup. These are opt-in
+environment variables, never enabled by CI.
 
 `replay` never executes stored shell commands, never inherits RT consent or a
 delegated path, and uses the **current checkout's preset implementation**. Keep the

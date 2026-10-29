@@ -131,7 +131,7 @@ Requires `memory` already enabled for children. In your new leaf:
 printf '25165824\n' > "$LEAF/memory.high"
 printf '67108864\n' > "$LEAF/memory.max"
 mkdir -p results/memory-control
-python3 -m schedlab.exec "$LEAF" "$PWD/build/sched-work" \
+python3 -m schedlab.exec "$LEAF" "$PWD/build/default/sched-work" \
   --mode audio --jobs 30 --memory demand --output results/memory-control/probe \
   > results/memory-control/native.json
 cat "$LEAF/memory.events"

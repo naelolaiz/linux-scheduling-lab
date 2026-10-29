@@ -15,7 +15,10 @@ from schedlab.cgroups import Unavailable, cpu_groups
 from schedlab.environment import capture, kernel_config, read
 from schedlab.metrics import distribution, quantile, summarize
 from schedlab.report import compare, write_report
-from schedlab.runner import BINARY, ROOT, cases, run, run_group
+from schedlab.runner import BINARY, NATIVE_DIR, ROOT, cases, run, run_group
+
+
+PIPELINE = NATIVE_DIR / "thread-pipeline"
 
 
 class MetricsTests(unittest.TestCase):
@@ -265,6 +268,11 @@ class HarnessTests(unittest.TestCase):
             if state.exists():
                 self.assertEqual(state.read_text().split()[2], "Z")  # Exited; awaiting init reaping.
 
+    def test_project_version_matches_manifest_version(self):
+        from schedlab import __version__
+        text = (ROOT / "pyproject.toml").read_text()
+        self.assertIn('\nversion = "%s"\n' % __version__, text)
+
     def test_cli_invalid(self):
         result = subprocess.run([sys.executable, "-m", "schedlab", "run", "quick", "--repetitions", "0"],
                                 cwd=ROOT, capture_output=True, timeout=5)
@@ -328,7 +336,7 @@ class PipelineTests(unittest.TestCase):
             path = Path(directory) / "pipeline.wav"
             for delay in (0, 50):
                 result = subprocess.run(
-                    [str(ROOT / "build/thread-pipeline"), "--output", str(path),
+                    [str(PIPELINE), "--output", str(path),
                      "--buffers", "20", "--consumer-delay-ms", str(delay)],
                     capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -343,20 +351,20 @@ class PipelineTests(unittest.TestCase):
     def test_pipeline_bounds(self):
         for value in ("0", "101", "not-a-number"):
             result = subprocess.run(
-                [str(ROOT / "build/thread-pipeline"), "--output", "/dev/null", "--buffers", value],
+                [str(PIPELINE), "--output", "/dev/null", "--buffers", value],
                 capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 2)
 
     @unittest.skipUnless(Path("/dev/full").exists(), "requires the Linux full device")
     def test_pipeline_write_failures_are_not_success(self):
         media_failure = subprocess.run(
-            [str(ROOT / "build/thread-pipeline"), "--output", "/dev/full", "--buffers", "1"],
+            [str(PIPELINE), "--output", "/dev/full", "--buffers", "1"],
             capture_output=True, text=True, timeout=5)
         self.assertEqual(media_failure.returncode, 1)
 
         with tempfile.TemporaryDirectory() as directory, Path("/dev/full").open("wb") as full:
             output_failure = subprocess.run(
-                [str(ROOT / "build/thread-pipeline"), "--output", str(Path(directory) / "ok.wav"),
+                [str(PIPELINE), "--output", str(Path(directory) / "ok.wav"),
                  "--buffers", "1"],
                 stdout=full, stderr=subprocess.PIPE, text=True, timeout=5)
         self.assertEqual(output_failure.returncode, 1)

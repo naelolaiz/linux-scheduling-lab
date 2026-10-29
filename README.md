@@ -12,16 +12,30 @@ For the synthetic media work, see the [native implementation](native/work.cpp)
 and [audio-callback design guidance](https://www.portaudio.com/docs/v19-doxydocs/writing_a_callback.html).
 Each lab in the tutorial has its own nearby API sources and further reading.
 
-The native engine is **C++20**; Python's standard library orchestrates experiments
-and produces offline HTML reports. No audio device, GUI, media framework, root,
-or systemd is needed for the quickstart. Gentoo/OpenRC is a first-class setup.
+The native engine is **C++20**, built with [CMake presets](CMakePresets.json);
+Python's standard library orchestrates experiments and produces offline HTML
+reports. No audio device, GUI, media framework, root, or systemd is needed for
+the quickstart. Gentoo/OpenRC is a first-class setup.
 
 ```sh
-make
-make test
-python3 -m schedlab run quick --repetitions 1 --out results/first
+uv run poe test      # CMake build in build/default, then the unprivileged test suite
+uv run poe lab run quick --repetitions 1 --out results/first
 # Open results/first/report.html in a browser; no server or internet needed.
 ```
+
+[uv](https://docs.astral.sh/uv/) and [Poe the Poet](https://poethepoet.natn.io/)
+are optional: each task in [`pyproject.toml`](pyproject.toml) (`uv run poe --help`)
+wraps one plain command, and the lab itself needs only the standard library.
+Without uv, the same quickstart is:
+
+```sh
+cmake --preset default && cmake --build --preset default
+python3 -m unittest discover -s tests -v
+python3 -m schedlab run quick --repetitions 1 --out results/first
+```
+
+Other presets build side by side in `build/<preset>`: `SCHEDLAB_PRESET=clang uv run poe test`,
+or `SCHEDLAB_NATIVE_DIR=build/clang python3 -m schedlab …` after a plain `clang` build.
 
 **Start with the [tutorial](docs/TUTORIAL.md).** It explains each hypothesis,
 command, measurement, tradeoff, permission and exercise. Continue with the
@@ -63,14 +77,16 @@ and [DEADLINE admission/bandwidth rules](https://docs.kernel.org/scheduler/sched
 The lab's [watchdog and opt-in checks](native/work.cpp) are additional safeguards,
 not kernel latency guarantees.
 
-**Requirements:** Linux, GNU Make, GCC 11+ or Clang 14+ with a C++20 standard
-library (including semaphores), Python 3.9+. The baseline targets Linux 5.4+;
+**Requirements:** Linux, CMake 3.21+ (with GNU Make or Ninja), GCC 11+ or Clang 14+
+with a C++20 standard library (including semaphores), Python 3.10+. Optional: uv
+for the `poe` tasks. The baseline targets Linux 5.4+;
 optional features are detected rather than assumed. glibc and musl are covered
 by CI, with x86-64/arm64 native jobs and arm64/RISC-V cross-compilation.
 See the tutorial for exact support boundaries.
 
 Build references: [GCC C++20 support](https://gcc.gnu.org/projects/cxx-status.html#cxx20),
-[Clang C++20 support](https://clang.llvm.org/cxx_status.html#cxx20), the exact
+[Clang C++20 support](https://clang.llvm.org/cxx_status.html#cxx20),
+[CMake presets](https://cmake.org/cmake/help/latest/manual/cmake-presets.7.html), the exact
 [CI matrix](.github/workflows/ci.yml), and [GitHub-hosted runner platforms](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 For this init-independent setup, see [Gentoo GCC](https://wiki.gentoo.org/wiki/GCC)
 and [OpenRC documentation](https://wiki.gentoo.org/wiki/OpenRC).

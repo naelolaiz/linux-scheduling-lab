@@ -37,7 +37,7 @@ calling that a separate experiment.
 On boot A:
 
 ```sh
-make
+cmake --preset default && cmake --build --preset default
 python3 -m schedlab run audio --repetitions 5 --label "machine-A / boot-A / audio" \
   --out results/boot-a-audio
 python3 -m schedlab run fairness --repetitions 5 --label "machine-A / boot-A / shares" \

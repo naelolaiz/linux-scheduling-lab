@@ -1,0 +1,58 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {"major": 3, "minor": 21, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "System C++ compiler (CXX or c++), -O2 -g",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo"}
+    },
+    {
+      "name": "gcc",
+      "inherits": "default",
+      "displayName": "GCC (g++)",
+      "cacheVariables": {"CMAKE_CXX_COMPILER": "g++"}
+    },
+    {
+      "name": "clang",
+      "inherits": "default",
+      "displayName": "Clang (clang++)",
+      "cacheVariables": {"CMAKE_CXX_COMPILER": "clang++"}
+    },
+    {
+      "name": "static",
+      "inherits": "default",
+      "displayName": "Statically linked executables (used for musl)",
+      "cacheVariables": {"CMAKE_EXE_LINKER_FLAGS": "-static"}
+    },
+    {
+      "name": "cross",
+      "hidden": true,
+      "inherits": "default",
+      "cacheVariables": {"CMAKE_SYSTEM_NAME": "Linux"}
+    },
+    {
+      "name": "aarch64-linux-gnu",
+      "inherits": "cross",
+      "displayName": "Cross-compile for arm64 (compile only)",
+      "cacheVariables": {"CMAKE_SYSTEM_PROCESSOR": "aarch64",
+                         "CMAKE_CXX_COMPILER": "aarch64-linux-gnu-g++"}
+    },
+    {
+      "name": "riscv64-linux-gnu",
+      "inherits": "cross",
+      "displayName": "Cross-compile for RISC-V 64 (compile only)",
+      "cacheVariables": {"CMAKE_SYSTEM_PROCESSOR": "riscv64",
+                         "CMAKE_CXX_COMPILER": "riscv64-linux-gnu-g++"}
+    }
+  ],
+  "buildPresets": [
+    {"name": "default", "configurePreset": "default"},
+    {"name": "gcc", "configurePreset": "gcc"},
+    {"name": "clang", "configurePreset": "clang"},
+    {"name": "static", "configurePreset": "static"},
+    {"name": "aarch64-linux-gnu", "configurePreset": "aarch64-linux-gnu"},
+    {"name": "riscv64-linux-gnu", "configurePreset": "riscv64-linux-gnu"}
+  ]
+}

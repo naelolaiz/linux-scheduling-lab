@@ -17,7 +17,9 @@ from .report import write_report
 
 
 ROOT = Path(__file__).resolve().parent.parent
-BINARY = ROOT / "build/sched-work"
+# A CMakePresets.json build directory; point elsewhere to use another compiler/preset.
+NATIVE_DIR = Path(os.environ.get("SCHEDLAB_NATIVE_DIR") or ROOT / "build/default").resolve()
+BINARY = NATIVE_DIR / "sched-work"
 PRESETS = ("quick", "offline", "fairness", "audio", "video", "mixed", "affinity",
            "rt", "sharing", "deadline", "locks", "memory", "cgroup")
 
@@ -159,7 +161,9 @@ def cases(preset, cpu, other_cpu):
 
 def run(preset, output, repetitions=3, cpu=None, allow_rt=False, parent=None, label=None):
     if not BINARY.is_file():
-        raise ValueError("native binary missing; run make first")
+        raise ValueError("native binary missing: %s; build it with "
+                         "'cmake --preset default && cmake --build --preset default' "
+                         "(or 'uv run poe build'), or set SCHEDLAB_NATIVE_DIR" % BINARY)
     allowed = sorted(os.sched_getaffinity(0))
     cpu = allowed[0] if cpu is None else cpu
     if cpu not in allowed:

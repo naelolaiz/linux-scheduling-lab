@@ -38,6 +38,24 @@ jobs:
           path: results/ci/
           retention-days: 7
 
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [asan, tsan]
+    env:
+      SCHEDLAB_PRESET: ${{ matrix.preset }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      # Sanitizer runtimes reserve fixed address ranges that high-entropy ASLR can collide with.
+      - name: Limit mmap randomization for the sanitizer runtimes
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Sanitized build and unprivileged tests (any report exits with status 99)
+        run: uv run --locked poe test
+
   lint:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

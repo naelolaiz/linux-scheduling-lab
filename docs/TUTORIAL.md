@@ -49,6 +49,13 @@ affected programs on the next build; no clean step is needed. To test or run the
 lab against another build, set `SCHEDLAB_NATIVE_DIR=build/<preset>`; the `poe`
 tasks derive it from `SCHEDLAB_PRESET=<preset>`.
 
+The `asan` and `tsan` presets need the compiler's sanitizer runtime (GCC's
+libsanitizer, built on Gentoo with `USE=sanitize`, or Clang's compiler-rt). A
+sanitizer report exits with status 99, which no lab path uses. If ThreadSanitizer
+stops with "unexpected memory mapping", the kernel's ASLR entropy is too high for
+that runtime; CI lowers it with `sysctl vm.mmap_rnd_bits=28`, which the lab never
+changes on your machine.
+
 **Build/setup sources:** [GCC](https://gcc.gnu.org/projects/cxx-status.html#cxx20),
 [Clang](https://clang.llvm.org/cxx_status.html#cxx20) and
 [libstdc++ library support](https://gcc.gnu.org/onlinedocs/libstdc++/manual/status.html)
@@ -491,7 +498,8 @@ The `uv run poe …` forms are optional shortcuts for the plain commands beside 
 
 | Command | Purpose |
 |---|---|
-| `cmake --preset P && cmake --build --preset P`, `uv run poe build` | Native C++20 build in `build/P`; presets `default`, `gcc`, `clang`, `static` and cross targets |
+| `cmake --preset P && cmake --build --preset P`, `uv run poe build` | Native C++20 build in `build/P`; presets `default`, `gcc`, `clang`, `asan`, `tsan`, `static` and cross targets |
+| `SCHEDLAB_PRESET=asan uv run poe test` (or `tsan`) | Tests under AddressSanitizer+UBSan or ThreadSanitizer; a report exits 99 and fails the test. Sanitized timings are not measurements |
 | `python3 -m unittest discover -s tests -v`, `uv run poe test` | Unprivileged correctness/integration tests (`poe test` builds first) |
 | `cmake --build --preset P --target clean`, `uv run poe clean` | Remove the built native executables |
 | `SCHEDLAB_NATIVE_DIR=build/P`, `SCHEDLAB_PRESET=P` | Use a non-default build for tests and runs (the latter for `poe` tasks) |

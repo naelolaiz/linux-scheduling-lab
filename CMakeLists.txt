@@ -12,6 +12,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(SCHEDLAB_WERROR "Treat compiler warnings as errors" ON)
+set(SCHEDLAB_SANITIZE "" CACHE STRING
+    "-fsanitize= list, e.g. address,undefined or thread (sanitized timings are not measurements)")
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
@@ -22,4 +24,10 @@ foreach(program IN ITEMS sched-work thread-pipeline)
   target_compile_options(${program} PRIVATE -Wall -Wextra -Wpedantic
                          $<$<BOOL:${SCHEDLAB_WERROR}>:-Werror>)
   target_link_libraries(${program} PRIVATE Threads::Threads m)
+  if(SCHEDLAB_SANITIZE)
+    target_sources(${program} PRIVATE native/sanitizer_options.cpp)
+    target_compile_options(${program} PRIVATE -fsanitize=${SCHEDLAB_SANITIZE}
+                           -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    target_link_options(${program} PRIVATE -fsanitize=${SCHEDLAB_SANITIZE})
+  endif()
 endforeach()

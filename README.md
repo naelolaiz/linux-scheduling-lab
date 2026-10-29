@@ -36,6 +36,10 @@ python3 -m schedlab run quick --repetitions 1 --out results/first
 
 Other presets build side by side in `build/<preset>`: `SCHEDLAB_PRESET=clang uv run poe test`,
 or `SCHEDLAB_NATIVE_DIR=build/clang python3 -m schedlab …` after a plain `clang` build.
+The `asan` ([AddressSanitizer](https://clang.llvm.org/docs/AddressSanitizer.html) +
+[UndefinedBehaviorSanitizer](https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html)) and
+`tsan` ([ThreadSanitizer](https://clang.llvm.org/docs/ThreadSanitizer.html)) presets run the
+same tests with any report failing the run; their timings are not measurements.
 `uv run poe format` and `uv run poe lint` apply and check [ruff](https://docs.astral.sh/ruff/),
 [clang-format](https://clang.llvm.org/docs/ClangFormat.html) and
 [clang-tidy](https://clang.llvm.org/extra/clang-tidy/) (configured in `pyproject.toml`,

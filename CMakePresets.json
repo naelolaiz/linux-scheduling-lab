@@ -21,6 +21,18 @@
       "cacheVariables": {"CMAKE_CXX_COMPILER": "clang++"}
     },
     {
+      "name": "asan",
+      "inherits": "default",
+      "displayName": "AddressSanitizer + UndefinedBehaviorSanitizer (tests only, not measurements)",
+      "cacheVariables": {"SCHEDLAB_SANITIZE": "address,undefined"}
+    },
+    {
+      "name": "tsan",
+      "inherits": "default",
+      "displayName": "ThreadSanitizer (tests only, not measurements)",
+      "cacheVariables": {"SCHEDLAB_SANITIZE": "thread"}
+    },
+    {
       "name": "static",
       "inherits": "default",
       "displayName": "Statically linked executables (used for musl)",
@@ -51,6 +63,8 @@
     {"name": "default", "configurePreset": "default"},
     {"name": "gcc", "configurePreset": "gcc"},
     {"name": "clang", "configurePreset": "clang"},
+    {"name": "asan", "configurePreset": "asan"},
+    {"name": "tsan", "configurePreset": "tsan"},
     {"name": "static", "configurePreset": "static"},
     {"name": "aarch64-linux-gnu", "configurePreset": "aarch64-linux-gnu"},
     {"name": "riscv64-linux-gnu", "configurePreset": "riscv64-linux-gnu"}

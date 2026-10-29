@@ -145,11 +145,24 @@ class NativeTests(unittest.TestCase):
             ("--policy", "deadline", "--mode", "audio", "--cpu", str(self.cpu)),
             ("--policy", "deadline", "--mode", "audio", "--runtime-us", "9000"),
             ("--policy", "deadline", "--mode", "audio", "--deadline-us", "20000"),
+            ("--unknown", "1"),
+            ("--allow-rt=yes",),
+            ("stray-argument",),
+            ("--jobs",),
         )
         for args in invalid:
             with self.subTest(args=args):
                 result = self.invoke(*args)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_option_value_forms_and_help(self):
+        data = self.success("--jobs=3", "--policy=batch", "--nice", "2")
+        self.assertEqual(
+            (data["samples"], data["effective"]["policy"], data["effective"]["nice"]), (3, "batch", 2)
+        )
+        result = subprocess.run([str(BINARY), "--help"], text=True, capture_output=True, timeout=18)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Exit codes", result.stdout)
 
     def test_rt_never_silently_falls_back(self):
         for policy in ("fifo", "rr", "deadline"):

@@ -4,50 +4,63 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <memory>
+#include <cmath>
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <ctime>
+#include <exception>
+#include <iostream>
 #include <new>
 #include <optional>
+#include <ostream>
 #include <semaphore>
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
-#include <errno.h>
-#include <getopt.h>
-#include <limits.h>
-#include <math.h>
 #include <pthread.h>
 #include <sched.h>
-#include <signal.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
 
+#include "json.hpp"
 #include "media.hpp"
 
 #ifndef SCHED_DEADLINE
 #define SCHED_DEADLINE 6
 #endif
 
+// POSIX remains where C++ has no equivalent: CLOCK_MONOTONIC/CLOCK_THREAD_CPUTIME_ID readings and
+// absolute clock_nanosleep releases (shared with the runner's time.monotonic_ns()), fork/waitpid
+// supervision, scheduler and affinity syscalls, mmap/mlock page probes, and pthreads created with
+// explicit FIFO attributes around a priority-inheritance mutex (std::thread/std::mutex cannot).
 namespace {
+
+// Exit statuses shared with the Python runner.
+namespace exit_code {
+constexpr int ok = 0;
+constexpr int failure = 1;
+constexpr int invalid = 2;
+constexpr int skipped = 77;
+} // namespace exit_code
 
 constexpr int WIDTH = 160;
 constexpr int HEIGHT = 90;
 constexpr int PIXELS = WIDTH * HEIGHT;
 constexpr int MAX_SAMPLES = 20000;
-constexpr size_t MEMORY_BYTES = size_t{16} * 1024 * 1024;
+constexpr std::size_t MEMORY_BYTES = std::size_t{16} * 1024 * 1024;
 
 enum class WorkloadMode { offline, audio, video, lock };
 enum class SchedulingPolicy { other, batch, idle, fifo, rr, deadline };
@@ -80,13 +93,16 @@ struct Sample {
     std::uint64_t finish = 0;
     std::uint64_t cpu = 0;
 };
-/* Linux's version-0 sched_setattr ABI, independent of libc header version. */
+// Linux's version-0 sched_setattr ABI, independent of libc header version.
 struct lab_sched_attr {
-    uint32_t size, policy;
-    uint64_t flags;
-    int32_t nice_value;
-    uint32_t priority;
-    uint64_t runtime, deadline, period;
+    std::uint32_t size;
+    std::uint32_t policy;
+    std::uint64_t flags;
+    std::int32_t nice_value;
+    std::uint32_t priority;
+    std::uint64_t runtime;
+    std::uint64_t deadline;
+    std::uint64_t period;
 };
 class Mapping {
     void *address_ = MAP_FAILED;
@@ -103,19 +119,19 @@ public:
         return address_ != MAP_FAILED;
     }
     [[nodiscard]] void *data() const { return address_; }
-    volatile unsigned char &operator[](size_t offset) {
+    volatile unsigned char &operator[](std::size_t offset) {
         return static_cast<volatile unsigned char *>(address_)[offset];
     }
 };
 struct buffers {
-    std::array<std::vector<uint8_t>, 2> planes;
-    std::span<uint8_t> image, scratch;
-    std::vector<int16_t> audio;
+    std::array<std::vector<std::uint8_t>, 2> planes;
+    std::span<std::uint8_t> image, scratch;
+    std::vector<std::int16_t> audio;
     Mapping pages;
     std::vector<Sample> samples;
-    size_t frames = 0, page_size = 0;
+    std::size_t frames = 0, page_size = 0;
     std::array<double, 128> filter{};
-    uint64_t checksum = 0;
+    std::uint64_t checksum = 0;
 };
 struct Effective {
     int policy = SCHED_OTHER;
@@ -125,8 +141,8 @@ struct Effective {
     lab_sched_attr attr{};
     std::uint64_t rr_quantum_ns = 0;
 };
-volatile sig_atomic_t interrupted;
-void handle_signal(int sig) { interrupted = sig; }
+volatile std::sig_atomic_t interrupted = 0;
+void handle_signal(int signal_number) { interrupted = signal_number; }
 
 // musl leaves the process-oriented sched_* wrappers as ENOSYS stubs.
 // These Linux syscalls deliberately address the current thread (TID 0).
@@ -151,52 +167,33 @@ ClockReading read_clock(clockid_t clock_id) noexcept {
                            static_cast<std::uint64_t>(timestamp.tv_nsec)};
 }
 int sleep_until(std::uint64_t ns) {
-    const timespec ts = {static_cast<time_t>(ns / 1000000000ULL), static_cast<long>(ns % 1000000000ULL)};
+    const timespec ts = {static_cast<std::time_t>(ns / 1000000000ULL), static_cast<long>(ns % 1000000000ULL)};
     int rc;
     do {
         rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
     } while (rc == EINTR && !interrupted);
     return rc;
 }
-void json_escaped(FILE &file, std::string_view text) {
-    for (const unsigned char c : text) {
-        if (c == '"' || c == '\\') {
-            fputc('\\', &file);
-            fputc(c, &file);
-        } else if (c < 32) {
-            fprintf(&file, "\\u%04x", c);
-        } else {
-            fputc(c, &file);
-        }
-    }
-}
-void json_string(FILE &file, std::string_view text) {
-    fputc('"', &file);
-    json_escaped(file, text);
-    fputc('"', &file);
-}
-int status(std::string_view state, std::string_view reason, int code) {
-    printf("{\"schema_version\":1,\"status\":");
-    json_string(*stdout, state);
-    printf(",\"reason\":");
-    json_string(*stdout, reason);
-    puts("}");
+
+// The one-line JSON result for runs that produce no measurements.
+int report(std::string_view state, std::string_view reason, int code) {
+    lab::json::Object(std::cout).field("schema_version", 1).field("status", state).field("reason", reason);
+    std::cout << '\n';
     return code;
 }
+int report_error(std::string_view reason) { return report("error", reason, exit_code::failure); }
+int report_skip(std::string_view reason) { return report("skipped", reason, exit_code::skipped); }
+// A failed system call: unavailable optional capabilities are skips, everything else is an error.
 int failure(std::string_view action, int error, bool optional) {
-    printf("{\"schema_version\":1,\"status\":\"%s\",\"reason\":\"", optional ? "skipped" : "error");
-    json_escaped(*stdout, action);
-    json_escaped(*stdout, ": ");
-    // Only the guardian's or worker's main thread reports failures, after any lock threads joined.
-    json_escaped(*stdout, strerror(error)); // NOLINT(concurrency-mt-unsafe)
-    printf(" (%d)\"}\n", error);
-    return optional ? 77 : 1;
+    const std::string reason = std::string(action) + ": " + std::generic_category().message(error) + " (" +
+                               std::to_string(error) + ")";
+    return optional ? report_skip(reason) : report_error(reason);
 }
 std::optional<int> number(std::string_view input, long min, long max, std::string_view name) {
     long n = 0;
-    auto [end, error] = std::from_chars(input.data(), input.data() + input.size(), n);
+    const auto [end, error] = std::from_chars(input.data(), input.data() + input.size(), n);
     if (error != std::errc{} || end != input.data() + input.size() || n < min || n > max) {
-        fprintf(stderr, "%.*s must be in [%ld, %ld]\n", static_cast<int>(name.size()), name.data(), min, max);
+        std::cerr << name << " must be in [" << min << ", " << max << "]\n";
         return std::nullopt;
     }
     return static_cast<int>(n);
@@ -239,7 +236,7 @@ int policy_id(SchedulingPolicy policy) {
     }
     return -1;
 }
-const char *mode_name(WorkloadMode mode) {
+std::string_view mode_name(WorkloadMode mode) {
     switch (mode) {
         case WorkloadMode::offline: return "offline";
         case WorkloadMode::audio: return "audio";
@@ -248,7 +245,7 @@ const char *mode_name(WorkloadMode mode) {
     }
     return "unknown";
 }
-const char *policy_name(SchedulingPolicy policy) {
+std::string_view policy_name(SchedulingPolicy policy) {
     switch (policy) {
         case SchedulingPolicy::other: return "other";
         case SchedulingPolicy::batch: return "batch";
@@ -259,7 +256,7 @@ const char *policy_name(SchedulingPolicy policy) {
     }
     return "unknown";
 }
-const char *memory_name(MemoryStrategy memory) {
+std::string_view memory_name(MemoryStrategy memory) {
     switch (memory) {
         case MemoryStrategy::demand: return "demand";
         case MemoryStrategy::prefault: return "prefault";
@@ -267,10 +264,10 @@ const char *memory_name(MemoryStrategy memory) {
     }
     return "unknown";
 }
-const char *protocol_name(LockProtocol protocol) {
+std::string_view protocol_name(LockProtocol protocol) {
     return protocol == LockProtocol::inherit ? "inherit" : "none";
 }
-const char *policy_name(int p) {
+std::string_view policy_name(int p) {
     switch (p) {
         case SCHED_OTHER: return "other";
         case SCHED_BATCH: return "batch";
@@ -282,206 +279,162 @@ const char *policy_name(int p) {
     }
 }
 void usage() {
-    puts("sched-work --output PREFIX [--mode offline|audio|video|lock]\n"
-         "  --policy other|batch|idle|fifo|rr|deadline --nice -20..19\n"
-         "  --cpu N --jobs 1..20000 --work 1..128 --warmup 0..100\n"
-         "  --period-us 1000..100000 --duration-ms 0..10000\n"
-         "  --start-ns MONOTONIC_NS --timeout-ms 100..15000\n"
-         "  --allow-rt --priority 1..20 --runtime-us N --deadline-us N\n"
-         "  --memory demand|prefault|mlock --protocol none|inherit\n"
-         "Default: 40 jobs, 4 filter passes, 10ms audio / 30ms video period.\n"
-         "Exit codes: 0 ok, 77 unavailable/permission/safety skip, 2 invalid, 1 failure.");
+    std::cout << "sched-work --output PREFIX [--mode offline|audio|video|lock]\n"
+                 "  --policy other|batch|idle|fifo|rr|deadline --nice -20..19\n"
+                 "  --cpu N --jobs 1..20000 --work 1..128 --warmup 0..100\n"
+                 "  --period-us 1000..100000 --duration-ms 0..10000\n"
+                 "  --start-ns MONOTONIC_NS --timeout-ms 100..15000\n"
+                 "  --allow-rt --priority 1..20 --runtime-us N --deadline-us N\n"
+                 "  --memory demand|prefault|mlock --protocol none|inherit\n"
+                 "Values follow the option (--jobs 40) or an equals sign (--jobs=40).\n"
+                 "Default: 40 jobs, 4 filter passes, 10ms audio / 30ms video period.\n"
+                 "Exit codes: 0 ok, 77 unavailable/permission/safety skip, 2 invalid, 1 failure.\n";
 }
+
 enum class ParseStatus { run, help, invalid };
 struct ParseResult {
     Options options;
     ParseStatus status = ParseStatus::invalid;
 };
-
-ParseResult parse(int argc, char **argv) {
+struct ParseState {
     Options options;
-    enum {
-        MODE = 1000,
-        POLICY,
-        OUTPUT,
-        MEMORY,
-        PROTOCOL,
-        JOBS,
-        WORK,
-        CPU,
-        NICE,
-        PRIORITY,
-        ALLOW_RT,
-        WARMUP,
-        PERIOD,
-        RUNTIME,
-        DEADLINE,
-        DURATION,
-        TIMEOUT,
-        START
-    };
-    const struct option opts[] = {{"mode", required_argument, nullptr, MODE},
-                                  {"policy", required_argument, nullptr, POLICY},
-                                  {"output", required_argument, nullptr, OUTPUT},
-                                  {"memory", required_argument, nullptr, MEMORY},
-                                  {"protocol", required_argument, nullptr, PROTOCOL},
-                                  {"jobs", required_argument, nullptr, JOBS},
-                                  {"work", required_argument, nullptr, WORK},
-                                  {"cpu", required_argument, nullptr, CPU},
-                                  {"nice", required_argument, nullptr, NICE},
-                                  {"priority", required_argument, nullptr, PRIORITY},
-                                  {"allow-rt", no_argument, nullptr, ALLOW_RT},
-                                  {"warmup", required_argument, nullptr, WARMUP},
-                                  {"period-us", required_argument, nullptr, PERIOD},
-                                  {"runtime-us", required_argument, nullptr, RUNTIME},
-                                  {"deadline-us", required_argument, nullptr, DEADLINE},
-                                  {"duration-ms", required_argument, nullptr, DURATION},
-                                  {"timeout-ms", required_argument, nullptr, TIMEOUT},
-                                  {"start-ns", required_argument, nullptr, START},
-                                  {"help", no_argument, nullptr, 'h'},
-                                  {nullptr, 0, nullptr, 0}};
     bool output_set = false;
     bool period_set = false;
-    int option;
-    // Options are parsed once, before the guardian forks or any thread exists.
-    while ((option = getopt_long(argc, argv, "h", opts, nullptr)) != -1) { // NOLINT(concurrency-mt-unsafe)
-        std::optional<int> parsed_number;
-        switch (option) {
-            case MODE: {
-                const auto value = parse_mode(optarg);
-                if (!value) {
-                    fputs("invalid mode\n", stderr);
-                    return {options, ParseStatus::invalid};
-                }
-                options.mode = *value;
-                break;
-            }
-            case POLICY: {
-                const auto value = parse_policy(optarg);
-                if (!value) {
-                    fputs("invalid policy\n", stderr);
-                    return {options, ParseStatus::invalid};
-                }
-                options.policy = *value;
-                break;
-            }
-            case OUTPUT:
-                options.output = optarg;
-                output_set = true;
-                break;
-            case MEMORY: {
-                const auto value = parse_memory(optarg);
-                if (!value) {
-                    fputs("invalid memory strategy\n", stderr);
-                    return {options, ParseStatus::invalid};
-                }
-                options.memory = *value;
-                break;
-            }
-            case PROTOCOL: {
-                const auto value = parse_protocol(optarg);
-                if (!value) {
-                    fputs("invalid mutex protocol\n", stderr);
-                    return {options, ParseStatus::invalid};
-                }
-                options.protocol = *value;
-                break;
-            }
-            case JOBS:
-                parsed_number = number(optarg, 1, MAX_SAMPLES, "jobs");
-                if (parsed_number) options.jobs = *parsed_number;
-                break;
-            case WORK:
-                parsed_number = number(optarg, 1, 128, "work");
-                if (parsed_number) options.work = *parsed_number;
-                break;
-            case CPU:
-                parsed_number = number(optarg, 0, CPU_SETSIZE - 1, "cpu");
-                if (parsed_number) options.cpu = *parsed_number;
-                break;
-            case NICE:
-                parsed_number = number(optarg, -20, 19, "nice");
-                if (parsed_number) options.nice_value = *parsed_number;
-                break;
-            case PRIORITY:
-                parsed_number = number(optarg, 1, 20, "priority");
-                if (parsed_number) options.priority = *parsed_number;
-                break;
-            case ALLOW_RT: options.allow_rt = true; break;
-            case WARMUP:
-                parsed_number = number(optarg, 0, 100, "warmup");
-                if (parsed_number) options.warmup = *parsed_number;
-                break;
-            case PERIOD:
-                parsed_number = number(optarg, 1000, 100000, "period-us");
-                if (parsed_number) {
-                    options.period_us = *parsed_number;
-                    period_set = true;
-                }
-                break;
-            case RUNTIME:
-                parsed_number = number(optarg, 100, 100000, "runtime-us");
-                if (parsed_number) options.runtime_us = *parsed_number;
-                break;
-            case DEADLINE:
-                parsed_number = number(optarg, 1000, 100000, "deadline-us");
-                if (parsed_number) options.deadline_us = *parsed_number;
-                break;
-            case DURATION:
-                parsed_number = number(optarg, 0, 10000, "duration-ms");
-                if (parsed_number) options.duration_ms = *parsed_number;
-                break;
-            case TIMEOUT:
-                parsed_number = number(optarg, 100, 15000, "timeout-ms");
-                if (parsed_number) options.timeout_ms = *parsed_number;
-                break;
-            case START: {
-                const std::string_view input(optarg);
-                auto [end, error] =
-                    std::from_chars(input.data(), input.data() + input.size(), options.start_ns);
-                if (error != std::errc{} || end != input.data() + input.size()) {
-                    fputs("start-ns must be an unsigned integer\n", stderr);
-                    return {options, ParseStatus::invalid};
-                }
-                break;
-            }
-            case 'h': return {options, ParseStatus::help};
-            default: return {options, ParseStatus::invalid};
-        }
-        if (!parsed_number.has_value() && option >= JOBS && option <= TIMEOUT && option != ALLOW_RT &&
-            option != START)
-            return {options, ParseStatus::invalid};
+};
+// Each handler validates and stores one option, explaining a rejected value on stderr.
+using OptionHandler = bool (*)(ParseState &state, std::string_view name, std::string_view value);
+struct OptionSpec {
+    std::string_view name;
+    bool takes_value;
+    OptionHandler apply;
+};
+
+template<auto Member, long Min, long Max>
+bool integer_option(ParseState &state, std::string_view name, std::string_view value) {
+    const auto parsed = number(value, Min, Max, name);
+    if (parsed) state.options.*Member = *parsed;
+    return parsed.has_value();
+}
+template<auto Member, auto Parse>
+bool choice_option(ParseState &state, std::string_view name, std::string_view value) {
+    const auto parsed = Parse(value);
+    if (!parsed) {
+        std::cerr << "invalid " << name << ": " << value << '\n';
+        return false;
     }
-    if (!period_set && options.mode == WorkloadMode::video) options.period_us = 30000;
-    if (optind != argc || !output_set) {
-        fputs("unexpected argument or missing --output\n", stderr);
-        return {options, ParseStatus::invalid};
+    state.options.*Member = *parsed;
+    return true;
+}
+bool output_option(ParseState &state, std::string_view /*name*/, std::string_view value) {
+    state.options.output = value;
+    state.output_set = true;
+    return true;
+}
+bool allow_rt_option(ParseState &state, std::string_view /*name*/, std::string_view /*value*/) {
+    state.options.allow_rt = true;
+    return true;
+}
+bool period_option(ParseState &state, std::string_view name, std::string_view value) {
+    if (!integer_option<&Options::period_us, 1000, 100000>(state, name, value)) return false;
+    state.period_set = true;
+    return true;
+}
+bool start_option(ParseState &state, std::string_view /*name*/, std::string_view value) {
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), state.options.start_ns);
+    if (error == std::errc{} && end == value.data() + value.size()) return true;
+    std::cerr << "start-ns must be an unsigned integer\n";
+    return false;
+}
+
+constexpr std::array option_table{
+    OptionSpec{"mode", true, choice_option<&Options::mode, parse_mode>},
+    OptionSpec{"policy", true, choice_option<&Options::policy, parse_policy>},
+    OptionSpec{"output", true, output_option},
+    OptionSpec{"memory", true, choice_option<&Options::memory, parse_memory>},
+    OptionSpec{"protocol", true, choice_option<&Options::protocol, parse_protocol>},
+    OptionSpec{"jobs", true, integer_option<&Options::jobs, 1, MAX_SAMPLES>},
+    OptionSpec{"work", true, integer_option<&Options::work, 1, 128>},
+    OptionSpec{"cpu", true, integer_option<&Options::cpu, 0, CPU_SETSIZE - 1>},
+    OptionSpec{"nice", true, integer_option<&Options::nice_value, -20, 19>},
+    OptionSpec{"priority", true, integer_option<&Options::priority, 1, 20>},
+    OptionSpec{"allow-rt", false, allow_rt_option},
+    OptionSpec{"warmup", true, integer_option<&Options::warmup, 0, 100>},
+    OptionSpec{"period-us", true, period_option},
+    OptionSpec{"runtime-us", true, integer_option<&Options::runtime_us, 100, 100000>},
+    OptionSpec{"deadline-us", true, integer_option<&Options::deadline_us, 1000, 100000>},
+    OptionSpec{"duration-ms", true, integer_option<&Options::duration_ms, 0, 10000>},
+    OptionSpec{"timeout-ms", true, integer_option<&Options::timeout_ms, 100, 15000>},
+    OptionSpec{"start-ns", true, start_option},
+};
+const OptionSpec *find_option(std::string_view name) {
+    for (const auto &spec : option_table)
+        if (spec.name == name) return &spec;
+    return nullptr;
+}
+
+ParseResult parse(std::span<char *const> args) {
+    ParseState state;
+    const ParseResult invalid{state.options, ParseStatus::invalid};
+    for (std::size_t index = 1; index < args.size(); index++) {
+        const std::string_view argument = args[index];
+        if (argument == "--help" || argument == "-h") return {state.options, ParseStatus::help};
+        if (!argument.starts_with("--")) {
+            std::cerr << "unexpected argument: " << argument << '\n';
+            return invalid;
+        }
+        std::string_view name = argument.substr(2);
+        std::optional<std::string_view> attached;
+        if (const auto equals = name.find('='); equals != std::string_view::npos) {
+            attached = name.substr(equals + 1);
+            name = name.substr(0, equals);
+        }
+        const OptionSpec *const spec = find_option(name);
+        if (!spec) {
+            std::cerr << "unrecognized option '--" << name << "'\n";
+            return invalid;
+        }
+        std::string_view value;
+        if (spec->takes_value && attached) {
+            value = *attached;
+        } else if (spec->takes_value && index + 1 < args.size()) {
+            value = args[++index];
+        } else if (spec->takes_value || attached) {
+            std::cerr << "option '--" << name << (attached ? "' takes no value\n" : "' requires a value\n");
+            return invalid;
+        }
+        if (!spec->apply(state, name, value)) return invalid;
+    }
+    Options &options = state.options;
+    if (!state.period_set && options.mode == WorkloadMode::video) options.period_us = 30000;
+    if (!state.output_set) {
+        std::cerr << "missing --output\n";
+        return invalid;
     }
     if (options.duration_ms && options.mode != WorkloadMode::offline) {
-        fputs("--duration-ms is only valid for offline mode\n", stderr);
-        return {options, ParseStatus::invalid};
+        std::cerr << "--duration-ms is only valid for offline mode\n";
+        return invalid;
     }
     if (options.policy == SchedulingPolicy::deadline &&
         (options.runtime_us > options.deadline_us || options.deadline_us > options.period_us ||
          options.runtime_us * 5 > options.period_us || options.cpu >= 0 ||
          options.mode == WorkloadMode::offline || options.mode == WorkloadMode::lock)) {
-        fputs(
-            "DEADLINE requires periodic mode, no --cpu, runtime <= deadline <= period, utilization <= 20%\n",
-            stderr);
-        return {options, ParseStatus::invalid};
+        std::cerr << "DEADLINE requires periodic mode, no --cpu, runtime <= deadline <= period, "
+                     "utilization <= 20%\n";
+        return invalid;
     }
     if (options.mode == WorkloadMode::lock && options.policy != SchedulingPolicy::fifo) {
-        fputs("lock mode requires --policy fifo\n", stderr);
-        return {options, ParseStatus::invalid};
+        std::cerr << "lock mode requires --policy fifo\n";
+        return invalid;
     }
     if (options.mode == WorkloadMode::lock && options.priority > 18) {
-        fputs("lock base priority must be <= 18 (high thread is base + 2)\n", stderr);
-        return {options, ParseStatus::invalid};
+        std::cerr << "lock base priority must be <= 18 (high thread is base + 2)\n";
+        return invalid;
     }
     if (options.mode == WorkloadMode::audio &&
         static_cast<std::uint64_t>(options.jobs) * options.period_us * 48000 / 1000000 > 10000000) {
-        fputs("audio output is limited to 10 million samples; reduce jobs/period\n", stderr);
-        return {options, ParseStatus::invalid};
+        std::cerr << "audio output is limited to 10 million samples; reduce jobs/period\n";
+        return invalid;
     }
     return {options, ParseStatus::run};
 }
@@ -506,7 +459,7 @@ int set_policy(const Options &options) {
     if (policy == SCHED_FIFO || policy == SCHED_RR) parameters.sched_priority = options.priority;
     return thread_scheduler::set(policy, parameters);
 }
-int optional_errno(int e) {
+bool optional_errno(int e) {
     return e == EPERM || e == EACCES || e == ENOSYS || e == EBUSY || e == EINVAL || e == ENOTSUP;
 }
 int allocate(buffers &storage, const Options &options) {
@@ -525,7 +478,7 @@ int allocate(buffers &storage, const Options &options) {
     storage.image = storage.planes[0];
     storage.scratch = storage.planes[1];
     if (!storage.pages.allocate()) return failure("map page probe", errno, false);
-    /* Commit output buffers before changing policy; the separate page probe is intentional. */
+    // Commit output buffers before changing policy; the separate page probe is intentional.
     std::ranges::fill(storage.samples, Sample{1, 1, 1, 1});
     std::ranges::fill(storage.audio, 1);
     if (options.memory != MemoryStrategy::demand)
@@ -556,7 +509,7 @@ void video_work(buffers &storage, int job, int work) {
 void audio_work(buffers &storage, int job, int work, bool save) {
     for (std::size_t n = 0; n < storage.frames; n++) {
         const std::size_t sample_index = static_cast<std::size_t>(job) * storage.frames + n;
-        double x = 0.6 * sin(6.283185307179586 * 440.0 * static_cast<double>(sample_index) / 48000.0);
+        double x = 0.6 * std::sin(6.283185307179586 * 440.0 * static_cast<double>(sample_index) / 48000.0);
         for (int p = 0; p < work; p++) {
             storage.filter[p] += 0.2 * (x - storage.filter[p]);
             x = storage.filter[p];
@@ -573,38 +526,34 @@ void probe_pages(buffers &storage, int job) {
         storage.pages[offset] = static_cast<unsigned char>(job);
     }
 }
-using lab::File;
-File open_artifact(std::string_view prefix, std::string_view extension) {
-    std::string path;
-    try {
-        path.reserve(prefix.size() + extension.size() + 1);
-        path.append(prefix);
-        path.push_back('.');
-        path.append(extension);
-    } catch (const std::bad_alloc &) {
-        errno = ENOMEM;
-        return {};
-    }
-    return File{fopen(path.c_str(), "wb")};
+
+std::string artifact_path(std::string_view prefix, std::string_view extension) {
+    std::string path(prefix);
+    path += '.';
+    path += extension;
+    return path;
 }
-int save_media(const Options &options, const buffers &storage, int count) {
-    File file;
-    bool written = false;
+std::error_code write_csv(const std::string &path, std::span<const Sample> samples) {
+    return lab::write_file(path, [samples](std::ostream &out) {
+        out << "index,release_ns,start_ns,finish_ns,cpu_ns\n";
+        for (std::size_t n = 0; n < samples.size(); n++) {
+            const Sample &sample = samples[n];
+            out << n << ',' << sample.release << ',' << sample.start << ',' << sample.finish << ','
+                << sample.cpu << '\n';
+        }
+        return std::error_code{};
+    });
+}
+std::error_code save_media(const Options &options, const buffers &storage, int count) {
     if (options.mode == WorkloadMode::audio) {
-        file = open_artifact(options.output, "wav");
-        if (!file) return -1;
-        written = lab::write_wav(
-            *file, std::span(storage.audio).first(static_cast<std::size_t>(count) * storage.frames));
-    } else {
-        file = open_artifact(options.output, "pgm");
-        if (!file) return -1;
-        written = fprintf(file.get(), "P5\n%d %d\n255\n", WIDTH, HEIGHT) >= 0 &&
-                  fwrite(storage.image.data(), 1, PIXELS, file.get()) == PIXELS;
+        const auto audio = std::span(storage.audio).first(static_cast<std::size_t>(count) * storage.frames);
+        return lab::write_wav(artifact_path(options.output, "wav"), audio);
     }
-    const int write_error = errno;
-    const bool closed = lab::close(file);
-    if (!written) errno = write_error;
-    return written && closed ? 0 : -1;
+    return lab::write_file(artifact_path(options.output, "pgm"), [&storage](std::ostream &out) {
+        out << "P5\n" << WIDTH << ' ' << HEIGHT << "\n255\n";
+        out.write(reinterpret_cast<const char *>(storage.image.data()), PIXELS);
+        return std::error_code{};
+    });
 }
 
 class PthreadMutex {
@@ -635,9 +584,9 @@ public:
 };
 
 struct ThreadResult {
-    const char *action = nullptr;
+    std::string_view action;
     int error = 0;
-    void record(const char *failed_action, int result) noexcept {
+    void record(std::string_view failed_action, int result) noexcept {
         if (result && !error) {
             action = failed_action;
             error = result;
@@ -714,7 +663,7 @@ void *high_thread(void *arg) {
 }
 struct ThreadStart {
     bool created = false;
-    const char *action = nullptr;
+    std::string_view action;
     int error = 0;
 };
 ThreadStart start_thread(pthread_t &thread, void *(*entry)(void *), lock_state &state, int priority) {
@@ -723,7 +672,7 @@ ThreadStart start_thread(pthread_t &thread, void *(*entry)(void *), lock_state &
     parameters.sched_priority = priority;
     int result = pthread_attr_init(&attributes);
     if (result) return {false, "initialize thread attributes", result};
-    const char *action = "configure explicit thread scheduling";
+    std::string_view action = "configure explicit thread scheduling";
     result = pthread_attr_setinheritsched(&attributes, PTHREAD_EXPLICIT_SCHED);
     if (!result) result = pthread_attr_setschedpolicy(&attributes, SCHED_FIFO);
     if (!result) result = pthread_attr_setschedparam(&attributes, &parameters);
@@ -761,29 +710,28 @@ int read_effective(Effective &effective) {
     }
     return 0;
 }
-void emit_effective(const Options &options, const Effective &effective) {
-    printf("\"build\":{\"cxx_standard\":%ld,\"compiler\":", __cplusplus);
-    json_string(*stdout, __VERSION__);
-    printf("},");
-    printf("\"requested\":{\"policy\":\"%s\",\"nice\":%d,\"priority\":%d,\"cpu\":%d},",
-           policy_name(options.policy), options.nice_value,
-           (options.policy == SchedulingPolicy::fifo || options.policy == SchedulingPolicy::rr)
-               ? options.priority
-               : 0,
-           options.cpu);
-    printf("\"effective\":{\"policy\":\"%s\",\"nice\":%d,\"priority\":%d,\"affinity\":[",
-           policy_name(effective.policy), effective.nice_value, effective.param.sched_priority);
-    int sep = 0;
+// The build, requested and effective scheduler sections shared by every successful result.
+void write_scheduler(lab::json::Object &result, const Options &options, const Effective &effective) {
+    result.object("build").field("cxx_standard", __cplusplus).field("compiler", __VERSION__);
+    const bool fixed_priority =
+        options.policy == SchedulingPolicy::fifo || options.policy == SchedulingPolicy::rr;
+    result.object("requested")
+        .field("policy", policy_name(options.policy))
+        .field("nice", options.nice_value)
+        .field("priority", fixed_priority ? options.priority : 0)
+        .field("cpu", options.cpu);
+    std::vector<int> affinity;
     for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
-        if (CPU_ISSET(cpu, &effective.cpus)) {
-            printf("%s%d", sep ? "," : "", cpu);
-            sep = 1;
-        }
-    printf("],\"rr_quantum_ns\":%llu,\"runtime_ns\":%llu,\"deadline_ns\":%llu,\"period_ns\":%llu},",
-           static_cast<unsigned long long>(effective.rr_quantum_ns),
-           static_cast<unsigned long long>(effective.attr.runtime),
-           static_cast<unsigned long long>(effective.attr.deadline),
-           static_cast<unsigned long long>(effective.attr.period));
+        if (CPU_ISSET(cpu, &effective.cpus)) affinity.push_back(cpu);
+    result.object("effective")
+        .field("policy", policy_name(effective.policy))
+        .field("nice", effective.nice_value)
+        .field("priority", effective.param.sched_priority)
+        .field("affinity", affinity)
+        .field("rr_quantum_ns", effective.rr_quantum_ns)
+        .field("runtime_ns", effective.attr.runtime)
+        .field("deadline_ns", effective.attr.deadline)
+        .field("period_ns", effective.attr.period);
 }
 int demote(const Options &options) {
     const sched_param zero{};
@@ -806,7 +754,7 @@ int lock_demo(const Options &options, std::array<buffers, 2> &storage) {
     using Entry = void *(*)(void *);
     const std::array<Entry, 3> entries{low_thread, medium_thread, high_thread};
     std::size_t created = 0;
-    const char *start_action = nullptr;
+    std::string_view start_action;
     for (std::size_t index = 0; index < threads.size(); index++) {
         const auto started =
             start_thread(threads[index], entries[index], state, options.priority + static_cast<int>(index));
@@ -845,28 +793,24 @@ int lock_demo(const Options &options, std::array<buffers, 2> &storage) {
     if (read_effective(effective)) return failure("read effective scheduler", errno, false);
     rc = demote(options);
     if (rc) return rc;
-    auto file = open_artifact(options.output, "csv");
-    if (!file) return failure("open lock CSV", errno, false);
-    const bool written =
-        fprintf(file.get(), "index,release_ns,start_ns,finish_ns,cpu_ns\n0,%llu,%llu,%llu,0\n",
-                static_cast<unsigned long long>(state.high_start),
-                static_cast<unsigned long long>(state.high_start),
-                static_cast<unsigned long long>(state.high_finish)) >= 0;
-    const int write_error = errno;
-    const bool closed = lab::close(file);
-    if (!written) errno = write_error;
-    if (!written || !closed) return failure("write lock CSV", errno, false);
-    printf("{\"schema_version\":1,\"status\":\"ok\",\"mode\":\"lock\",");
-    emit_effective(options, effective);
-    printf("\"lock\":{\"protocol\":\"%s\",\"high_wait_ns\":%llu,"
-           "\"low_finish_ns\":%llu,\"medium_finish_ns\":%llu,"
-           "\"low_priority\":%d,\"medium_priority\":%d,\"high_priority\":%d},",
-           protocol_name(options.protocol),
-           static_cast<unsigned long long>(state.high_finish - state.high_start),
-           static_cast<unsigned long long>(state.low_finish),
-           static_cast<unsigned long long>(state.medium_finish), options.priority, options.priority + 1,
-           options.priority + 2);
-    puts("\"samples\":1,\"period_ns\":0}");
+    const std::array<Sample, 1> wait{Sample{state.high_start, state.high_start, state.high_finish, 0}};
+    if (const auto error = write_csv(artifact_path(options.output, "csv"), wait))
+        return failure("write lock CSV", error.value(), false);
+    {
+        lab::json::Object result(std::cout);
+        result.field("schema_version", 1).field("status", "ok").field("mode", "lock");
+        write_scheduler(result, options, effective);
+        result.object("lock")
+            .field("protocol", protocol_name(options.protocol))
+            .field("high_wait_ns", state.high_finish - state.high_start)
+            .field("low_finish_ns", state.low_finish)
+            .field("medium_finish_ns", state.medium_finish)
+            .field("low_priority", options.priority)
+            .field("medium_priority", options.priority + 1)
+            .field("high_priority", options.priority + 2);
+        result.field("samples", 1).field("period_ns", 0);
+    }
+    std::cout << '\n';
     return 0;
 }
 int worker(const Options &options) {
@@ -892,7 +836,7 @@ int worker(const Options &options) {
         limit.rlim_cur = std::min(limit.rlim_cur, limit.rlim_max);
         if (setrlimit(RLIMIT_RTTIME, &limit)) return failure("set RLIMIT_RTTIME", errno, false);
     }
-    /* Warm-up the processing code, not the demand-fault probe. */
+    // Warm up the processing code, not the demand-fault probe.
     for (int n = 0; n < options.warmup; n++) {
         if (options.mode == WorkloadMode::audio)
             audio_work(storage[0], n, options.work, false);
@@ -901,15 +845,15 @@ int worker(const Options &options) {
     }
     if (set_policy(options)) return failure("set scheduler/nice", errno, optional_errno(errno));
     if (thread_scheduler::policy() != policy_id(options.policy))
-        return status("error", "effective scheduler does not match request", 1);
+        return report_error("effective scheduler does not match request");
     if (options.mode == WorkloadMode::lock) return lock_demo(options, storage);
     const auto current = read_clock(CLOCK_MONOTONIC);
     if (!current) return failure("read monotonic clock", current.error, false);
     const std::uint64_t now = current.nanoseconds;
     const std::uint64_t origin = options.start_ns ? options.start_ns : now + 20000000ULL;
     if (origin < now || origin - now > 2000000000ULL)
-        return status("error", "start-ns must be in the next two seconds (warmup may have overrun it)", 1);
-    if (sleep_until(origin)) return status("error", "initial sleep interrupted", 1);
+        return report_error("start-ns must be in the next two seconds (warmup may have overrun it)");
+    if (sleep_until(origin)) return report_error("initial sleep interrupted");
     rusage before{};
     rusage after{};
     const bool before_available = getrusage(RUSAGE_SELF, &before) == 0;
@@ -921,7 +865,7 @@ int worker(const Options &options) {
         Sample &sample = storage[0].samples[count];
         sample.release =
             periodic ? origin + static_cast<std::uint64_t>(count) * options.period_us * 1000 : origin;
-        if (periodic && sleep_until(sample.release)) return status("error", "periodic sleep interrupted", 1);
+        if (periodic && sleep_until(sample.release)) return report_error("periodic sleep interrupted");
         const auto start = read_clock(CLOCK_MONOTONIC);
         if (!start) return failure("read job start clock", start.error, false);
         sample.start = start.nanoseconds;
@@ -940,73 +884,67 @@ int worker(const Options &options) {
         if (!finish) return failure("read job finish clock", finish.error, false);
         sample.finish = finish.nanoseconds;
         count++;
-        if (interrupted) return status("error", "worker interrupted", 1);
+        if (interrupted) return report_error("worker interrupted");
         if (options.duration_ms && sample.finish >= end) break;
     }
     const bool after_available = getrusage(RUSAGE_SELF, &after) == 0;
     if (!after_available && !rusage_error) rusage_error = errno;
     const bool rusage_available = before_available && after_available;
     if (options.duration_ms && count == MAX_SAMPLES && storage[0].samples[count - 1].finish < end)
-        return status("error", "sample capacity exceeded; increase work or shorten duration", 1);
-    /* Return to ordinary scheduling before writing artifacts. */
+        return report_error("sample capacity exceeded; increase work or shorten duration");
+    // Return to ordinary scheduling before writing artifacts.
     Effective effective;
     if (read_effective(effective)) return failure("read effective scheduler", errno, false);
     rc = demote(options);
     if (rc) return rc;
-    auto file = open_artifact(options.output, "csv");
-    if (!file) return failure("open CSV", errno, false);
-    bool csv_written = fprintf(file.get(), "index,release_ns,start_ns,finish_ns,cpu_ns\n") >= 0;
-    for (int n = 0; n < count; n++) {
-        const Sample &sample = storage[0].samples[n];
-        if (csv_written)
-            csv_written = fprintf(file.get(), "%d,%llu,%llu,%llu,%llu\n", n,
-                                  static_cast<unsigned long long>(sample.release),
-                                  static_cast<unsigned long long>(sample.start),
-                                  static_cast<unsigned long long>(sample.finish),
-                                  static_cast<unsigned long long>(sample.cpu)) >= 0;
-    }
-    const int csv_error = errno;
-    const bool csv_closed = lab::close(file);
-    if (!csv_written) errno = csv_error;
-    if (!csv_written || !csv_closed || save_media(options, storage[0], count))
-        return failure("write artifacts", errno ? errno : EIO, false);
-    printf("{\"schema_version\":1,\"status\":\"ok\",\"mode\":\"%s\",", mode_name(options.mode));
-    emit_effective(options, effective);
+    const auto measured = std::span(storage[0].samples).first(static_cast<std::size_t>(count));
+    std::error_code error = write_csv(artifact_path(options.output, "csv"), measured);
+    if (!error) error = save_media(options, storage[0], count);
+    if (error) return failure("write artifacts", error.value(), false);
     const std::uint64_t period_ns = periodic ? static_cast<std::uint64_t>(options.period_us) * 1000 : 0;
     const std::uint64_t window_ns = static_cast<std::uint64_t>(options.duration_ms) * 1000000;
     const std::uint64_t elapsed = count ? storage[0].samples[count - 1].finish - origin : window_ns;
-    printf("\"samples\":%d,\"period_ns\":%llu,\"elapsed_ns\":%llu,\"window_ns\":%llu,"
-           "\"checksum\":%llu,\"rusage_available\":%s,",
-           count, static_cast<unsigned long long>(period_ns), static_cast<unsigned long long>(elapsed),
-           static_cast<unsigned long long>(window_ns), static_cast<unsigned long long>(storage[0].checksum),
-           rusage_available ? "true" : "false");
-    if (rusage_available) {
-        printf("\"minor_faults\":%ld,\"major_faults\":%ld,\"voluntary_cs\":%ld,"
-               "\"involuntary_cs\":%ld,\"rusage_error\":null,",
-               after.ru_minflt - before.ru_minflt, after.ru_majflt - before.ru_majflt,
-               after.ru_nvcsw - before.ru_nvcsw, after.ru_nivcsw - before.ru_nivcsw);
-    } else {
-        printf("\"minor_faults\":null,\"major_faults\":null,\"voluntary_cs\":null,"
-               "\"involuntary_cs\":null,\"rusage_error\":%d,",
-               rusage_error);
+    using Counter = std::optional<long>;
+    const auto counter = [rusage_available](long after_value, long before_value) {
+        return rusage_available ? Counter(after_value - before_value) : std::nullopt;
+    };
+    {
+        lab::json::Object result(std::cout);
+        result.field("schema_version", 1).field("status", "ok").field("mode", mode_name(options.mode));
+        write_scheduler(result, options, effective);
+        result.field("samples", count)
+            .field("period_ns", period_ns)
+            .field("elapsed_ns", elapsed)
+            .field("window_ns", window_ns)
+            .field("checksum", storage[0].checksum)
+            .field("rusage_available", rusage_available)
+            .field("minor_faults", counter(after.ru_minflt, before.ru_minflt))
+            .field("major_faults", counter(after.ru_majflt, before.ru_majflt))
+            .field("voluntary_cs", counter(after.ru_nvcsw, before.ru_nvcsw))
+            .field("involuntary_cs", counter(after.ru_nivcsw, before.ru_nivcsw))
+            .field("rusage_error", rusage_available ? std::nullopt : std::optional<int>(rusage_error))
+            .field("memory", memory_name(options.memory))
+            .field("work", options.work)
+            .field("warmup", options.warmup);
+        result.object("deadline")
+            .field("runtime_us", options.runtime_us)
+            .field("deadline_us", options.deadline_us)
+            .field("period_us", options.period_us);
     }
-    printf("\"memory\":\"%s\",\"work\":%d,\"warmup\":%d,"
-           "\"deadline\":{\"runtime_us\":%d,\"deadline_us\":%d,\"period_us\":%d}}\n",
-           memory_name(options.memory), options.work, options.warmup, options.runtime_us, options.deadline_us,
-           options.period_us);
+    std::cout << '\n';
     return 0;
 }
-int flush_stdout(int result) noexcept {
+// Reports output errors, including earlier ones the stream has already recorded. std::cout stays
+// synchronized with stdio, so it buffers nothing of its own across fork() and errno reflects the
+// failed write.
+int flush_stdout(int result) {
     errno = 0;
-    const int flush_result = fflush(stdout);
-    if (!flush_result && !ferror(stdout)) return result;
+    std::cout.flush();
+    if (std::cout) return result;
     const int output_error = errno ? errno : EIO;
-    // Called only from a process's main thread when it is about to exit.
-    fprintf(stderr, "write standard output: %s (%d)\n",
-            strerror(output_error), // NOLINT(concurrency-mt-unsafe)
-            output_error);
-    fflush(stderr);
-    return result == 0 ? 1 : result;
+    std::cerr << "write standard output: " << std::generic_category().message(output_error) << " ("
+              << output_error << ")\n";
+    return result == exit_code::ok ? exit_code::failure : result;
 }
 
 int kill_and_reap(pid_t child) noexcept {
@@ -1021,15 +959,13 @@ int kill_and_reap(pid_t child) noexcept {
     return first_error;
 }
 
-} // namespace
-
-int main(int argc, char **argv) {
-    const ParseResult parsed = parse(argc, argv);
+int guarded_run(std::span<char *const> args) {
+    const ParseResult parsed = parse(args);
     if (parsed.status == ParseStatus::help) {
         usage();
-        return flush_stdout(0);
+        return flush_stdout(exit_code::ok);
     }
-    if (parsed.status == ParseStatus::invalid) return 2;
+    if (parsed.status == ParseStatus::invalid) return exit_code::invalid;
     const Options &options = parsed.options;
     const int policy = policy_id(options.policy);
     const bool real_time = policy == SCHED_FIFO || policy == SCHED_RR || policy == SCHED_DEADLINE;
@@ -1038,8 +974,8 @@ int main(int argc, char **argv) {
     if (sched_getaffinity(0, sizeof(allowed), &allowed))
         return failure("read allowed CPUs (CPU_SETSIZE bound)", errno, false);
     if (options.cpu >= 0 && !CPU_ISSET(options.cpu, &allowed)) {
-        fprintf(stderr, "requested CPU is not in the effective allowed mask\n");
-        return 2;
+        std::cerr << "requested CPU is not in the effective allowed mask\n";
+        return exit_code::invalid;
     }
     const int initial_policy = thread_scheduler::policy();
     if (initial_policy < 0)
@@ -1049,24 +985,27 @@ int main(int argc, char **argv) {
     const int initial_nice = getpriority(PRIO_PROCESS, 0);
     if (errno) return failure("inspect guardian nice", errno, optional_errno(errno));
     if (initial_policy != SCHED_OTHER || initial_nice > 0)
-        return status("skipped", "guardian requires SCHED_OTHER and nice <= 0; do not launch via chrt/nice",
-                      77);
-    if (real_time && !options.allow_rt) return status("skipped", "RT requires explicit --allow-rt", 77);
+        return report_skip("guardian requires SCHED_OTHER and nice <= 0; do not launch via chrt/nice");
+    if (real_time && !options.allow_rt) return report_skip("RT requires explicit --allow-rt");
     if (real_time && CPU_COUNT(&allowed) < 2)
-        return status("skipped", "RT requires at least two allowed CPUs for housekeeping", 77);
+        return report_skip("RT requires at least two allowed CPUs for housekeeping");
     if (real_time && policy != SCHED_DEADLINE && options.cpu < 0)
-        return status("skipped", "FIFO/RR require an explicit worker CPU, leaving another for watchdog", 77);
+        return report_skip("FIFO/RR require an explicit worker CPU, leaving another for watchdog");
     struct sigaction action{};
     action.sa_handler = handle_signal;
     if (sigemptyset(&action.sa_mask) || sigaction(SIGTERM, &action, nullptr) ||
         sigaction(SIGINT, &action, nullptr))
         return failure("install guardian signal handlers", errno, false);
-    /* DEADLINE inherits the original domain-wide mask, never the watchdog's pin. */
+    // DEADLINE inherits the original domain-wide mask, never the watchdog's pin.
     const pid_t child = fork();
     if (child < 0) return failure("fork guardian", errno, false);
     if (child == 0) {
-        const int result = worker(options);
-        _exit(flush_stdout(result));
+        int result = exit_code::failure;
+        try {
+            result = worker(options);
+        } catch (const std::bad_alloc &) { result = failure("allocate memory", ENOMEM, false); }
+        // Leave without running the guardian's exit handlers or static destructors.
+        std::_Exit(flush_stdout(result));
     }
     if (real_time) {
         cpu_set_t guard;
@@ -1110,12 +1049,22 @@ int main(int argc, char **argv) {
         if (interrupted || current.nanoseconds >= stop) {
             const int cleanup_error = kill_and_reap(child);
             if (cleanup_error) return failure("terminate worker", cleanup_error, false);
-            return status(
-                "error",
-                interrupted ? "interrupted; worker killed" : "wall-clock watchdog expired; worker killed", 1);
+            return report_error(interrupted ? "interrupted; worker killed"
+                                            : "wall-clock watchdog expired; worker killed");
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     if (WIFEXITED(wstatus)) return WEXITSTATUS(wstatus);
-    return status("error", "worker terminated by signal (possibly RLIMIT_RTTIME)", 1);
+    return report_error("worker terminated by signal (possibly RLIMIT_RTTIME)");
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+    try {
+        return guarded_run(std::span<char *const>(argv, static_cast<std::size_t>(argc)));
+    } catch (const std::exception &error) {
+        std::cerr << "sched-work: " << error.what() << '\n';
+        return exit_code::failure;
+    }
 }

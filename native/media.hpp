@@ -1,57 +1,63 @@
 #pragma once
 #include <cerrno>
 #include <cstdint>
-#include <cstdio>
+#include <fstream>
+#include <ios>
 #include <limits>
-#include <memory>
+#include <ostream>
 #include <span>
+#include <string>
+#include <system_error>
 
 namespace lab {
-struct FileCloser {
-    void operator()(FILE *file) const noexcept {
-        if (file) std::fclose(file);
-    }
-};
-using File = std::unique_ptr<FILE, FileCloser>;
 
-inline bool close(File &file) noexcept {
-    FILE *handle = file.release();
-    return !handle || std::fclose(handle) == 0;
+// Streams keep no error code, but on Linux the failing system call leaves errno set.
+inline std::error_code stream_error() noexcept { return {errno != 0 ? errno : EIO, std::generic_category()}; }
+
+// Writes a whole binary file through `writer(std::ostream &)`, reporting open, write and close failures
+// alike.
+template<typename Writer>
+std::error_code write_file(const std::string &path, Writer &&writer) {
+    errno = 0;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return stream_error();
+    if (const std::error_code error = writer(out)) return error;
+    out.close();
+    return out ? std::error_code{} : stream_error();
 }
 
-inline bool little16(FILE &file, std::uint16_t value) noexcept {
+inline void put_le16(std::ostream &out, std::uint16_t value) {
     const unsigned bits = value;
-    return std::fputc(static_cast<int>(bits & 0xFFU), &file) != EOF &&
-           std::fputc(static_cast<int>(bits >> 8U), &file) != EOF;
+    out.put(static_cast<char>(bits & 0xFFU));
+    out.put(static_cast<char>(bits >> 8U));
 }
-inline bool little32(FILE &file, std::uint32_t value) noexcept {
-    return little16(file, static_cast<std::uint16_t>(value)) &&
-           little16(file, static_cast<std::uint16_t>(value >> 16));
+inline void put_le32(std::ostream &out, std::uint32_t value) {
+    put_le16(out, static_cast<std::uint16_t>(value & 0xFFFFU));
+    put_le16(out, static_cast<std::uint16_t>(value >> 16U));
 }
 
-inline bool write_wav(FILE &file, std::span<const std::int16_t> audio) noexcept {
+// 48 kHz mono 16-bit PCM.
+inline std::error_code write_wav(std::ostream &out, std::span<const std::int16_t> audio) {
     constexpr auto max_samples = (std::numeric_limits<std::uint32_t>::max() - 36U) / 2U;
-    if (audio.size() > max_samples) {
-        errno = EFBIG;
-        return false;
-    }
+    if (audio.size() > max_samples) return std::make_error_code(std::errc::file_too_large);
     const auto bytes = static_cast<std::uint32_t>(audio.size() * 2U);
-    if (std::fwrite("RIFF", 1, 4, &file) != 4 || !little32(file, 36U + bytes) ||
-        std::fwrite("WAVEfmt ", 1, 8, &file) != 8 || !little32(file, 16) || !little16(file, 1) ||
-        !little16(file, 1) || !little32(file, 48000) || !little32(file, 96000) || !little16(file, 2) ||
-        !little16(file, 16) || std::fwrite("data", 1, 4, &file) != 4 || !little32(file, bytes))
-        return false;
-    for (const auto sample : audio)
-        if (!little16(file, static_cast<std::uint16_t>(sample))) return false;
-    return true;
+    out << "RIFF";
+    put_le32(out, 36U + bytes);
+    out << "WAVEfmt ";
+    put_le32(out, 16);    // format chunk size
+    put_le16(out, 1);     // PCM
+    put_le16(out, 1);     // channels
+    put_le32(out, 48000); // sample rate
+    put_le32(out, 96000); // byte rate
+    put_le16(out, 2);     // block alignment
+    put_le16(out, 16);    // bits per sample
+    out << "data";
+    put_le32(out, bytes);
+    for (const auto sample : audio) put_le16(out, static_cast<std::uint16_t>(sample));
+    return out ? std::error_code{} : stream_error();
 }
-inline bool write_wav(const char *path, std::span<const std::int16_t> audio) noexcept {
-    File file{std::fopen(path, "wb")};
-    if (!file) return false;
-    const bool written = write_wav(*file, audio);
-    const int write_error = errno;
-    const bool closed = close(file);
-    if (!written) errno = write_error;
-    return written && closed;
+inline std::error_code write_wav(const std::string &path, std::span<const std::int16_t> audio) {
+    return write_file(path, [audio](std::ostream &out) { return write_wav(out, audio); });
 }
+
 } // namespace lab

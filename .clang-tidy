@@ -1,12 +1,9 @@
 # Static analysis for native/; `uv run poe lint` runs it on build/<preset>/compile_commands.json.
 # Disabled checks are style preferences that do not fit this small POSIX-facing code:
-# - designated initializers, trailing commas: positional getopt tables and aggregate returns
+# - designated initializers, trailing commas: positional option tables and aggregate returns
 # - math parentheses: ordinary arithmetic precedence needs none
-# - raw string literals: JSON is emitted through escaped printf formats
-# - deprecated headers: the POSIX code deliberately uses C headers and unqualified C names
 # - pragma once: supported by every targeted compiler
-# - non-copyable objects: FILE is passed by reference, never copied
-# - enum size: a few tiny enums; int also matches getopt_long's return type
+# - enum size: a few tiny enums; their size never matters
 Checks: >
   -*,
   bugprone-*,
@@ -15,12 +12,9 @@ Checks: >
   concurrency-*,
   misc-*,
   -misc-include-cleaner,
-  -misc-non-copyable-objects,
   -misc-non-private-member-variables-in-classes,
   modernize-*,
   -modernize-avoid-c-arrays,
-  -modernize-deprecated-headers,
-  -modernize-raw-string-literal,
   -modernize-use-designated-initializers,
   -modernize-use-trailing-return-type,
   performance-*,

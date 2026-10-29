@@ -523,7 +523,8 @@ Native options: `--mode offline|audio|video|lock`, `--policy other|batch|idle|fi
 `--runtime-us 100..100000`, `--deadline-us 1000..100000`,
 `--duration-ms 0..10000` (offline only), `--timeout-ms 100..15000`,
 `--start-ns N`, `--memory demand|prefault|mlock`, `--protocol none|inherit`,
-`--allow-rt`, `--output PREFIX`.
+`--allow-rt`, `--output PREFIX`. A value follows its option (`--jobs 40`) or an
+equals sign (`--jobs=40`); option names are never abbreviated.
 `--start-ns` is an absolute monotonic common start in the next two seconds after
 setup; omit it for ordinary manual runs. Audio is capped at ten million samples.
 Choose job count/period/work that fit the watchdog, rather than expecting it to

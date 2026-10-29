@@ -4,13 +4,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <iostream>
-#include <memory>
+#include <new>
 #include <span>
 #include <stop_token>
 #include <string_view>
@@ -23,10 +24,12 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "json.hpp"
 #include "media.hpp"
 
 namespace {
 constexpr std::size_t frames = 480;
+constexpr std::size_t queue_capacity = 8;
 struct Block {
     std::size_t sequence = 0;
     std::array<std::int16_t, frames> audio{};
@@ -103,7 +106,7 @@ int main(int argc, char **argv) {
     }
     const int policy = static_cast<int>(syscall(SYS_sched_getscheduler, 0));
     if (policy < 0) {
-        std::perror("inspect scheduler");
+        std::cerr << "inspect scheduler: " << std::generic_category().message(errno) << '\n';
         return 1;
     }
     if (policy != SCHED_OTHER) {
@@ -112,7 +115,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     try {
-        SpscQueue<Block, 8> queue;
+        SpscQueue<Block, queue_capacity> queue;
         std::vector<std::int16_t> recording(static_cast<std::size_t>(buffers) * frames, 0);
         std::atomic<bool> producer_done{false};
         std::size_t consumed = 0;
@@ -157,15 +160,20 @@ int main(int argc, char **argv) {
         });
         producer.join();
         consumer.join(); // Explicit drain before scope-exit requests cancellation.
-        if (!lab::write_wav(output, recording)) {
-            std::perror("write WAV");
+        if (const auto error = lab::write_wav(output, recording)) {
+            std::cerr << "write WAV: " << error.message() << '\n';
             return 1;
         }
-        std::cout << "{\"status\":\"ok\",\"policy\":\"other\",\"buffers\":" << buffers
-                  << ",\"consumed\":" << consumed << ",\"dropped\":" << dropped
-                  << ",\"queue_capacity\":8,\"consumer_delay_ms\":" << consumer_delay_ms
-                  << ",\"device_xruns_measured\":false}\n"
-                  << std::flush;
+        lab::json::Object(std::cout)
+            .field("status", "ok")
+            .field("policy", "other")
+            .field("buffers", buffers)
+            .field("consumed", consumed)
+            .field("dropped", dropped)
+            .field("queue_capacity", queue_capacity)
+            .field("consumer_delay_ms", consumer_delay_ms)
+            .field("device_xruns_measured", false);
+        std::cout << '\n' << std::flush;
         if (!std::cout) {
             std::cerr << "write standard output failed\n";
             return 1;

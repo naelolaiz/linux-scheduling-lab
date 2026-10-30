@@ -53,6 +53,10 @@ sequence = ["build", { cmd = "python -m unittest discover -s tests -v" }]
 help = "Run the schedlab CLI against that build, e.g. `poe lab run quick`"
 cmd = "python -m schedlab"
 
+[tool.poe.tasks.vm]
+help = "Run presets and opt-in checks in QEMU/KVM guests through podman, e.g. `poe vm run quick`"
+cmd = "python -m schedlab vm"
+
 [tool.poe.tasks.analyze]
 help = "Summarize saved runs: tables, plots, findings, caveats (--format text|markdown|json)"
 cmd = "python -m schedlab analyze"

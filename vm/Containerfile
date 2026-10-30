@@ -1,0 +1,61 @@
+# Images for lab VMs; `schedlab vm` builds them with
+#   podman build -f vm/Containerfile --target tools -t localhost/schedlab-vm .
+# native: static musl build of the C++ programs. guest: the root filesystem that becomes the
+# initramfs (Alpine, Python, the lab). tools: QEMU plus the guest tree, which boots the VMs.
+# builder (target builder, tag localhost/schedlab-vm-builder): source kernels and sched_ext tools.
+
+FROM docker.io/library/alpine:3.24 AS native
+RUN apk add --no-cache g++ cmake make
+WORKDIR /src
+COPY CMakeLists.txt CMakePresets.json ./
+COPY native/ native/
+RUN cmake --preset static >/dev/null && cmake --build --preset static --parallel
+
+FROM docker.io/library/alpine:3.24 AS guest
+# The .pth file puts /lab on the guest's import path, including for `python3 -I`. Without
+# /sbin/init, a broken /init panics the kernel (and so ends QEMU) instead of starting busybox init.
+# libelf, zlib and zstd are the sched_ext schedulers' runtime libraries.
+RUN apk add --no-cache python3 libelf zlib zstd-libs \
+    && echo /lab > "$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/schedlab.pth" \
+    && rm /sbin/init
+COPY --from=native /src/build/static/sched-work /src/build/static/sched-load \
+    /src/build/static/thread-pipeline /lab/build/static/
+COPY pyproject.toml /lab/
+COPY tests/ /lab/tests/
+COPY schedlab/ /lab/schedlab/
+COPY --chmod=0755 vm/init /init
+
+FROM docker.io/library/debian:trixie-slim AS tools
+# dpkg-deb unpacks .deb kernel packages, bsdtar (libarchive-tools) .rpm ones.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        qemu-system-x86 python3 ca-certificates libarchive-tools \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=guest / /guest/
+# Host-side interference for the noisy-neighbour scenario.
+COPY --from=native /src/build/static/sched-load /lab/build/static/
+COPY schedlab/ /lab/schedlab/
+ENV PYTHONPATH=/lab
+WORKDIR /lab
+
+# The same musl userspace as the guest, so the schedulers it builds run there.
+FROM docker.io/library/alpine:3.24 AS builder
+RUN apk add --no-cache argp-standalone bash bc bison build-base clang cmake coreutils diffutils \
+    elfutils-dev findutils flex gawk grep libarchive-tools linux-headers llvm musl-obstack-dev \
+    openssl-dev perl python3 tar xz zlib-dev zstd zstd-dev
+# Kernels with KF_IMPLICIT_ARGS kfuncs (7.0 and later) need pahole 1.31 or newer, or their BTF
+# keeps the implicit arguments and sched_ext schedulers fail to load; Alpine 3.24 has 1.30.
+ARG DWARVES=1.32
+ARG DWARVES_SHA256=319cbf319e9fc92065a5407ce47eb868d73566f3d4840a56832734e4579df947
+RUN wget -q -O /tmp/dwarves.tar.xz "https://fedorapeople.org/~acme/dwarves/dwarves-${DWARVES}.tar.xz" \
+    && echo "${DWARVES_SHA256}  /tmp/dwarves.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/dwarves.tar.xz -C /tmp \
+    && cmake -S "/tmp/dwarves-${DWARVES}" -B /tmp/dwarves-build -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr >/dev/null \
+    && cmake --build /tmp/dwarves-build --parallel >/dev/null \
+    && cmake --install /tmp/dwarves-build >/dev/null \
+    && rm -rf /tmp/dwarves* \
+    && pahole --version
+COPY schedlab/ /lab/schedlab/
+ENV PYTHONPATH=/lab
+WORKDIR /lab

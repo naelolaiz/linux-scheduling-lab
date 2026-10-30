@@ -1,8 +1,8 @@
-"""Inside the tools container: fetch kernels into the store, assemble initramfs images, boot QEMU,
-pin vCPUs, run host-side interference and unpack the guest's results.
+"""Inside the tools container: fetch kernels and published builds into the store, assemble initramfs
+images, boot QEMU, pin vCPUs, run host-side interference and unpack the guest's results.
 
 The store is mounted at /store (the podman volume or SCHEDLAB_VM_STORE); apart from it, only the
-output directory is written. Usage: python3 -m schedlab.vm.machine fetch|boot|list ...
+output directory is written. Usage: python3 -m schedlab.vm.machine fetch|prebuilt|boot|list ...
 """
 
 import argparse
@@ -41,6 +41,14 @@ def say(text):
 
 def kernel_dir(name):
     return STORE / "kernels" / name
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while chunk := stream.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def download(package, destination):
@@ -133,9 +141,61 @@ def fetch(name):
     return record
 
 
+def fetch_prebuilt(name):
+    """The published build of `name` (catalog.PREBUILT), checked against its pinned SHA-256: a
+    source kernel whole, or the schedulers of a distribution kernel already in the store."""
+    package = catalog.prebuilt(name)
+    if package is None:
+        raise RuntimeError(f"{name} has no published build")
+    target = kernel_dir(name)
+    source = catalog.kernel_kind(name) == "source"
+    if not source and not (target / "kernel.json").exists():
+        raise RuntimeError(f"{name} is not in the store; fetch it first")
+    downloads = STORE / "downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    asset = downloads / package["asset"]
+    staging = Path(tempfile.mkdtemp(dir=STORE, prefix=f".{name}-"))
+    try:
+        say(f"downloading {package['asset']}")
+        url, sha256 = download(package, asset)
+        with tarfile.open(asset) as archive:
+            archive.extractall(staging, filter="data")
+        unpacked = staging / name
+        origin = {"asset": package["asset"], "url": url, "sha256": sha256}
+        if source:
+            (unpacked / "prebuilt.json").write_text(json.dumps(origin, indent=2) + "\n")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            unpacked.rename(target)
+        else:
+            built = json.loads((unpacked / "schedulers.json").read_text())
+            if built["kernel_vmlinuz_sha256"] != sha256_file(target / "vmlinuz"):
+                raise RuntimeError(f"{package['asset']} was built for another {name} kernel image")
+            shutil.rmtree(target / "scx", ignore_errors=True)
+            (unpacked / "scx").rename(target / "scx")
+            (unpacked / "schedulers.json").rename(target / "schedulers.json")
+            (target / "prebuilt.json").write_text(json.dumps(origin, indent=2) + "\n")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        asset.unlink(missing_ok=True)
+    say(f"{name}: published build {package['asset']} ready")
+
+
+def kernel_record(name):
+    """A stored kernel's record, with the record of schedulers built for it (schedulers.json) and
+    the release asset it came from (prebuilt.json) when there are such files."""
+    directory = kernel_dir(name)
+    record = json.loads((directory / "kernel.json").read_text())
+    if (directory / "schedulers.json").exists():
+        built = json.loads((directory / "schedulers.json").read_text())
+        record.update(schedulers=built.pop("schedulers"), schedulers_build=built)
+    if (directory / "prebuilt.json").exists():
+        record["prebuilt"] = json.loads((directory / "prebuilt.json").read_text())
+    return record
+
+
 def installed():
     """Every kernel in the store with its record."""
-    return [json.loads(path.read_text()) for path in sorted((STORE / "kernels").glob("*/kernel.json"))]
+    return [kernel_record(path.parent.name) for path in sorted((STORE / "kernels").glob("*/kernel.json"))]
 
 
 class InitramfsArchive(Archive):
@@ -335,10 +395,9 @@ def unpack(frame_path, staging):
 
 def boot(spec, out):
     """Run one job in one VM and write its results to `out`, which must not exist yet."""
-    kernel_path = kernel_dir(spec["kernel"]) / "kernel.json"
-    if not kernel_path.exists():
+    if not (kernel_dir(spec["kernel"]) / "kernel.json").exists():
         raise RuntimeError(f"kernel {spec['kernel']} is not in the store; fetch or build it first")
-    kernel = json.loads(kernel_path.read_text())
+    kernel = kernel_record(spec["kernel"])
     accel = spec.get("accel", "kvm")
     if accel == "kvm" and not os.access("/dev/kvm", os.R_OK | os.W_OK):
         raise RuntimeError("/dev/kvm is not usable here; pass --device /dev/kvm (or use accel tcg)")
@@ -451,6 +510,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     fetcher = commands.add_parser("fetch")
     fetcher.add_argument("kernels", nargs="+", choices=catalog.KERNELS)
+    prebuilt = commands.add_parser("prebuilt", help="download published builds (tries every one)")
+    prebuilt.add_argument("kernels", nargs="+", choices=catalog.PREBUILT)
     commands.add_parser("list")
     booter = commands.add_parser("boot")
     booter.add_argument("--spec", required=True, help="VM configuration and job, as JSON")
@@ -461,6 +522,15 @@ def main(argv=None):
             for name in args.kernels:
                 fetch(name)
             return 0
+        if args.command == "prebuilt":
+            failed = 0
+            for name in args.kernels:
+                try:
+                    fetch_prebuilt(name)
+                except (OSError, RuntimeError, ValueError, KeyError, tarfile.TarError) as exc:
+                    print(f"error: {name}: {exc}", file=sys.stderr)
+                    failed += 1
+            return 1 if failed else 0
         if args.command == "list":
             print(json.dumps(installed(), indent=2))
             return 0

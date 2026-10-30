@@ -95,17 +95,30 @@ def stored_kernels():
     return {record["name"]: record for record in json.loads(completed.stdout)}
 
 
-def ensure_kernels(names, scx=()):
-    """Fetch missing distribution kernels, build missing source kernels, and build the sched_ext
-    schedulers of the distribution kernels in `scx` (source kernels build their own)."""
+def pending_builds(names, scx, stored):
+    """Source kernels among `names` and schedulers for the distribution kernels in `scx` that the
+    store lacks (source kernels bring their own schedulers)."""
+    sources = {name for name in names if name not in stored and catalog.kernel_kind(name) == "source"}
+    return sorted(sources | {name for name in scx if not stored.get(name, {}).get("schedulers")})
+
+
+def ensure_kernels(names, scx=(), prebuilt=True):
+    """Fetch missing distribution kernels, then provide missing source kernels and the sched_ext
+    schedulers of the distribution kernels in `scx`: downloaded when the lab publishes them (unless
+    `prebuilt` is false), built from source otherwise or when the download fails."""
     build_image("tools", TOOLS_IMAGE)
     stored = stored_kernels()
-    missing = {name for name in names if name not in stored}
-    fetch = sorted(name for name in missing if catalog.kernel_kind(name) == "distribution")
+    fetch = sorted(
+        name for name in names if name not in stored and catalog.kernel_kind(name) == "distribution"
+    )
     if fetch and container(TOOLS_IMAGE, ["schedlab.vm.machine", "fetch", *fetch]):
         raise RuntimeError("kernel download failed")
-    sources = {name for name in missing if catalog.kernel_kind(name) == "source"}
-    builds = sorted(sources | {name for name in scx if not stored.get(name, {}).get("schedulers")})
+    builds = pending_builds(names, scx, stored)
+    published = [name for name in builds if catalog.prebuilt(name)] if prebuilt else []
+    if published:
+        if container(TOOLS_IMAGE, ["schedlab.vm.machine", "prebuilt", *published]):
+            say("a published build could not be downloaded; building it from source instead")
+        builds = pending_builds(names, scx, stored_kernels())
     if builds:
         say(f"building {', '.join(builds)}: this takes minutes and is kept in the store")
         build_image("builder", BUILDER_IMAGE)
@@ -198,6 +211,10 @@ def command_kernels(_args):
     print("\nSource kernels (built on first use): linux-VERSION[-PREEMPT][-hzN][-nohzfull][-scx]")
     print(f"  VERSION: {', '.join(catalog.SOURCES)}; PREEMPT: {', '.join(catalog.PREEMPT_MODELS)}; ", end="")
     print(f"N: {', '.join(map(str, catalog.HZ_VALUES))}")
+    print("\nPublished builds (downloaded instead of built; `vm verify NAME` rebuilds one to compare):")
+    for name in catalog.PREBUILT:
+        contents = "kernel" if catalog.kernel_kind(name) == "source" else "sched_ext schedulers"
+        print(f"  {name:20} {contents:21} {catalog.prebuilt(name)['asset']}")
     print("\nMatrices (python3 -m schedlab vm matrix NAME PRESET):")
     for name, matrix in catalog.MATRICES.items():
         print(f"  {name:12} {matrix['description']}")
@@ -213,12 +230,28 @@ def command_fetch(args):
 
 def command_build(args):
     if catalog.kernel_kind(args.kernel) == "source":
-        ensure_kernels([args.kernel])
+        ensure_kernels([args.kernel], prebuilt=False)
     elif scx_capable(args.kernel):
-        ensure_kernels([args.kernel], scx=[args.kernel])
+        ensure_kernels([args.kernel], scx=[args.kernel], prebuilt=False)
     else:
         raise ValueError(f"{args.kernel} is a distribution kernel without usable sched_ext: `vm fetch` it")
     return 0
+
+
+def command_verify(args):
+    if catalog.kernel_kind(args.kernel) == "distribution":
+        if not scx_capable(args.kernel):
+            raise ValueError(f"{args.kernel} has no usable sched_ext, so the lab builds nothing for it")
+        # The schedulers are built against the distribution's own kernel image.
+        ensure_kernels([args.kernel])
+    build_image("builder", BUILDER_IMAGE)
+    command = ["schedlab.vm.build", "--verify", args.kernel]
+    mounts = []
+    if args.assets:
+        args.assets.mkdir(parents=True, exist_ok=True)
+        mounts.append(f"{args.assets.resolve()}:/assets")
+        command += ["--assets", "/assets"]
+    return container(BUILDER_IMAGE, command, mounts=mounts)
 
 
 def command_run(args):
@@ -265,13 +298,20 @@ def add_parser(commands):
     vm = commands.add_parser("vm", help="run presets and opt-in checks inside QEMU/KVM guests (podman)")
     actions = vm.add_subparsers(dest="vm_command", required=True)
     actions.add_parser("kernels", help="list bootable kernels, matrices and the store's contents")
-    fetcher = actions.add_parser("fetch", help="download distribution kernels into the store")
-    fetcher.add_argument("kernels", nargs="+", choices=catalog.KERNELS)
+    fetcher = actions.add_parser("fetch", help="download distribution kernels and published source kernels")
+    published_sources = [name for name in catalog.PREBUILT if name not in catalog.KERNELS]
+    fetcher.add_argument("kernels", nargs="+", choices=[*catalog.KERNELS, *published_sources])
     builder = actions.add_parser(
         "build",
-        help="build a source kernel (e.g. linux-7.2.13-rt-hz1000) or a distribution kernel's schedulers",
+        help="build a source kernel (e.g. linux-7.2.13-rt-hz1000) or a distribution kernel's schedulers "
+        "from source, even when a published build exists",
     )
     builder.add_argument("kernel")
+    verifier = actions.add_parser(
+        "verify", help="rebuild a published build from source and check that it is identical, byte for byte"
+    )
+    verifier.add_argument("kernel", help="a name from `vm kernels`, e.g. linux-7.2.13-hz1000")
+    verifier.add_argument("--assets", type=Path, help="also write the release assets (build and source) here")
 
     def machine_options(parser, kernel=True):
         if kernel:
@@ -315,6 +355,7 @@ def main(args):
         "kernels": command_kernels,
         "fetch": command_fetch,
         "build": command_build,
+        "verify": command_verify,
         "run": command_run,
         "matrix": command_matrix,
         "test": command_test,

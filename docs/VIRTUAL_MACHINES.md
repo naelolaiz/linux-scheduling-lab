@@ -22,13 +22,14 @@ reference for absolute latency.
   (`--group-add keep-groups`) so the guest can use KVM. x86-64 hosts only.
 - **Images**, built from [`vm/Containerfile`](../vm/Containerfile) on first use and
   then reused from podman's cache: `localhost/schedlab-vm` (QEMU plus the guest,
-  about 300 MB) and, only for source kernels and sched_ext schedulers,
+  about 300 MB) and, only when something is built from source,
   `localhost/schedlab-vm-builder`.
 - **The store**, a podman volume named `schedlab-vm`: each kernel's image and
   config (15–25 MB per kernel; the packages they come from are deleted after
-  extraction), kernel.org tarballs used for builds (about 150 MB each) and built
-  schedulers. Set `SCHEDLAB_VM_STORE=/some/directory` to use a directory instead;
-  CI does this to cache it.
+  extraction), kernel.org tarballs used for builds (about 150 MB each) and
+  sched_ext schedulers, built or [downloaded](#published-builds). Set
+  `SCHEDLAB_VM_STORE=/some/directory` to use a directory instead; CI does this to
+  cache it.
 - **Results** are ordinary run directories, so `schedlab analyze`, `report` and
   `compare` work unchanged. Each also has a `vm/` directory: `vm.json` (kernel
   record, boot parameters, QEMU version and arguments, topology, pinning, host
@@ -85,10 +86,11 @@ distribution moves on: snapshot.debian.org, Launchpad, Fedora's Koji build syste
 These are the distributions' own builds, with their configs and patches.
 
 **sched_ext** needs a kernel with `CONFIG_SCHED_CLASS_EXT` and a BPF scheduler
-whose kfunc declarations match the kernel's BTF. The lab builds the kernel's
+whose kfunc declarations match the kernel's BTF. The lab uses the kernel's
 example schedulers (`scx_simple`, `scx_qmap`, `scx_central` from
-`tools/sched_ext`) on first use. For Fedora 44 it builds them from the matching
-kernel.org release; for Rocky 10 it uses Rocky's own patched source package,
+`tools/sched_ext`), downloaded as [published builds](#published-builds) or
+built on first use. For Fedora 44 they come from the matching kernel.org
+release; for Rocky 10 they come from Rocky's own patched source package,
 because Rocky's 6.12 carries a backported sched_ext that no kernel.org release
 matches. The Debian 7.2 kernels enable sched_ext, but no scheduler can load on
 them. Their BTF was generated with pahole 1.30, which leaves the implicit
@@ -118,12 +120,78 @@ stops the build with an explicit message, so nothing is silently substituted. A
 named preemption model is fixed at build time (`PREEMPT_DYNAMIC` off). A build takes
 5–15 minutes and a few GB of temporary space inside the builder container. `-scx`
 adds BTF debug information, which roughly doubles both. `vm run`, `matrix` and `test`
-build a missing kernel themselves; `vm build` does it ahead of time.
+download a missing kernel when it is [published](#published-builds) and build it
+otherwise; `vm build` always builds from source, ahead of time.
 
 **Sources:** [kernel.org releases](https://www.kernel.org/category/releases.html),
 [kernel build configuration](https://docs.kernel.org/kbuild/kconfig.html),
 [preemption models](https://docs.kernel.org/core-api/real-time/differences.html),
 [snapshot.debian.org](https://snapshot.debian.org/).
+
+### Published builds
+
+Builds take minutes to hours, so the lab publishes the ones its matrices need as
+assets of its
+[`kernels` release](https://github.com/naelolaiz/linux-scheduling-lab/releases/tag/kernels):
+the three `timer-hz` kernels, `linux-7.2.13-scx`, and the sched_ext schedulers for
+`fedora-44`, `rocky-10` and `rocky-10-rt`. `vm run`, `matrix`, `test` and `fetch`
+download these instead of building them, check each against the SHA-256 pinned in
+`PREBUILT` in [`catalog.py`](../schedlab/vm/catalog.py), and build from source when
+the download fails. `vm kernels` lists them. A downloaded build's record names the
+asset it came from (`prebuilt`), and so does `vm/vm.json` in every run that boots
+it.
+
+The builds are reproducible: the same source, options and builder packages give
+the same bytes on any machine. Instead of the build machine's time, user and host,
+a kernel is stamped with its source's release date, a fixed user and host, and
+build number 1. Every build runs in the same directory, so paths in debug and BPF
+information match, and the record holds no times. To check a published build
+yourself:
+
+```sh
+python3 -m schedlab vm verify linux-7.2.13-hz1000
+```
+
+This rebuilds it in the builder container, packs it the way the release does and
+compares the result with the pinned SHA-256. When they differ, it lists the record
+fields that differ from the published build's, such as the image's SHA-256 or a
+package version. The record lists the toolchain: the builder's gcc, binutils,
+clang, LLVM, musl, busybox, Python and xz packages, and pahole. Alpine updates
+packages within a release branch, so a rebuild months later can differ only
+because a tool changed, and the record shows which one.
+
+The [kernels workflow](../.github/workflows/kernels.yml) rebuilds each pinned build
+on a GitHub-hosted runner and publishes it only if it reproduces the pinned
+SHA-256, which comes from a separate `vm verify` run. Every published asset was
+therefore built twice, on different machines, with identical results. Each asset
+also has a build provenance attestation that names the workflow run and the commit
+that built it:
+
+```sh
+gh attestation verify linux-7.2.13-hz1000-<digest>.tar.xz --repo naelolaiz/linux-scheduling-lab
+```
+
+The release also carries the corresponding source, as the GPL asks of anyone who
+distributes kernel binaries. That means the kernel source tarballs the builds used
+(kernel.org releases, and Rocky's own tarball for its schedulers), each build's
+config inside its asset, and `schedlab-<commit>.tar.gz`, the lab at the commit
+that published them. Its `vm/Containerfile` and `schedlab/vm/build.py` are the
+build recipe.
+
+**Changing a published build.** A new pinned release, build option or builder
+package changes a build's digest. `vm verify NAME` prints the new SHA-256, which
+goes into `PREBUILT`. Pull requests that change the recipe (`build.py`,
+`vm/Containerfile` or the workflow) rebuild every published build in CI and fail
+when one no longer reproduces its pin. Running the workflow by hand publishes the
+pinned builds that the release lacks. An asset's name carries the first 16 hex
+digits of its digest, so a new build never replaces one that an older checkout
+pins.
+
+**Sources:** [reproducible kernel builds](https://docs.kernel.org/kbuild/reproducible-builds.html),
+[`SOURCE_DATE_EPOCH`](https://reproducible-builds.org/specs/source-date-epoch/),
+[artifact attestations](https://docs.github.com/en/actions/concepts/security/artifact-attestations),
+[releases](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases),
+[GPL version 2, section 3](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html#section3).
 
 ## 4. Matrices
 

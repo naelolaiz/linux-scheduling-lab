@@ -1,10 +1,15 @@
-"""VM tooling that needs no VM: formats, catalog, QEMU and kernel-config arguments, analysis."""
+"""VM tooling that needs no VM: formats, catalog, published builds, QEMU and kernel-config
+arguments, analysis."""
 
+import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -113,6 +118,25 @@ class CatalogTests(unittest.TestCase):
                 if entry.get("neighbour"):
                     self.assertTrue(entry.get("pin"), f"{name}/{entry['name']}")
 
+    def test_published_builds_cover_what_the_matrices_build(self):
+        for name, sha256 in catalog.PREBUILT.items():
+            with self.subTest(build=name):
+                self.assertRegex(sha256, SHA256)
+                if catalog.kernel_kind(name) == "distribution":
+                    self.assertTrue(catalog.KERNELS[name].get("scx_source"), "only schedulers are built")
+                package = catalog.prebuilt(name)
+                self.assertTrue(package["asset"].startswith(f"{name}-") and sha256[:16] in package["asset"])
+                self.assertEqual(package["urls"], [catalog.PREBUILT_URL + package["asset"]])
+        built = {
+            entry["kernel"]
+            for matrix in catalog.MATRICES.values()
+            for entry in matrix["entries"]
+            if catalog.kernel_kind(entry["kernel"]) == "source" or entry.get("scx")
+        }
+        self.assertLessEqual(built, set(catalog.PREBUILT))
+        self.assertIsNone(catalog.prebuilt("debian-7.2"))
+        self.assertIn("-schedulers-", catalog.prebuilt_asset("fedora-44", "0" * 64))
+
 
 KERNEL = {"name": "debian-7.2", "release": "7.2.11+deb13-amd64"}
 
@@ -177,6 +201,167 @@ class BuildConfigTests(unittest.TestCase):
             )
 
 
+class ReproducibleBuildTests(unittest.TestCase):
+    def test_build_identity_comes_from_the_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            makefile = Path(temp) / "Makefile"
+            makefile.write_text("VERSION = 7\n")
+            os.utime(makefile, (0, 1793026874))
+            environment = build.build_environment(Path(temp))
+        self.assertEqual(environment["SOURCE_DATE_EPOCH"], "1793026874")
+        self.assertEqual(environment["KBUILD_BUILD_TIMESTAMP"], "Mon Oct 26 15:01:14 UTC 2026")
+        self.assertEqual(
+            [environment[f"KBUILD_BUILD_{key}"] for key in ("USER", "HOST", "VERSION")],
+            ["schedlab", "schedlab", "1"],
+        )
+
+    def test_pack_ignores_times_owners_modes_and_creation_order(self):
+        digests = []
+        for mtime, mode, scx_first in ((1, 0o664, True), (2000000000, 0o600, False)):
+            with tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp) / "linux-7.2.13-scx"
+                directory.mkdir()
+                files = [("scx/scx_simple", b"\x7fELF"), ("kernel.json", b"{}\n")]
+                for relative, content in files if scx_first else reversed(files):
+                    (directory / relative).parent.mkdir(exist_ok=True)
+                    (directory / relative).write_bytes(content)
+                (directory / "scx/scx_simple").chmod(0o750)
+                (directory / "kernel.json").chmod(mode)
+                for path in [directory, *directory.rglob("*")]:
+                    os.utime(path, (mtime, mtime))
+                digests.append(build.pack(directory, Path(temp) / "asset.tar.xz"))
+                with tarfile.open(Path(temp) / "asset.tar.xz") as archive:
+                    members = {member.name: member for member in archive.getmembers()}
+        self.assertEqual(digests[0], digests[1])
+        self.assertEqual(
+            list(members),
+            [
+                "linux-7.2.13-scx",
+                "linux-7.2.13-scx/kernel.json",
+                "linux-7.2.13-scx/scx",
+                "linux-7.2.13-scx/scx/scx_simple",
+            ],
+        )
+        self.assertEqual(members["linux-7.2.13-scx/scx/scx_simple"].mode, 0o755)
+        self.assertEqual(members["linux-7.2.13-scx/kernel.json"].mode, 0o644)
+        self.assertTrue(all(member.uid == 0 and member.mtime == 0 for member in members.values()))
+
+    def test_toolchain_versions(self):
+        installed = "\n".join(
+            [
+                "binutils-2.45.1-r1 x86_64 {binutils} (GPL-2.0-or-later) [installed]",
+                "clang22-22.1.3-r2 x86_64 {clang22} (Apache-2.0 WITH LLVM-exception) [installed]",
+                "gcc-15.2.0-r5 x86_64 {gcc} (GPL-2.0-or-later AND LGPL-2.1-or-later) [installed]",
+                "llvm-22-r0 x86_64 {llvm-meta} (Apache-2.0) [installed]",
+                "musl-dev-1.2.6-r3 x86_64 {musl} (MIT) [installed]",
+                "zstd-libs-1.5.7-r2 x86_64 {zstd} (BSD-3-Clause) [installed]",
+            ]
+        )
+        self.assertEqual(
+            build.parse_toolchain(installed),
+            {"binutils": "2.45.1-r1", "clang22": "22.1.3-r2", "gcc": "15.2.0-r5", "musl-dev": "1.2.6-r3"},
+        )
+
+    def test_differences_name_what_changed(self):
+        ours = {"name": "x", "vmlinuz_sha256": "a", "toolchain": {"gcc": "15.2.0-r5", "pahole": "v1.32"}}
+        theirs = {"name": "x", "vmlinuz_sha256": "b", "toolchain": {"gcc": "15.2.0-r6", "pahole": "v1.32"}}
+        self.assertEqual(
+            build.differences(ours, theirs),
+            ["toolchain.gcc: 15.2.0-r5 here, 15.2.0-r6 published", "vmlinuz_sha256: a here, b published"],
+        )
+
+
+class PrebuiltTests(unittest.TestCase):
+    """Published builds installed from a local "release" through file:// URLs."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.store = self.root / "store"
+        self.release = self.root / "release"
+        self.store.mkdir()
+        self.release.mkdir()
+        for patcher in (
+            patch.object(machine, "STORE", self.store),
+            patch.object(catalog, "PREBUILT_URL", self.release.as_uri() + "/"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def publish(self, name, files):
+        """`files` packed as the release asset of `name`; returns the asset's SHA-256."""
+        directory = self.root / "build" / name
+        for relative, content in files.items():
+            (directory / relative).parent.mkdir(parents=True, exist_ok=True)
+            (directory / relative).write_bytes(content)
+            if relative.startswith("scx/"):
+                (directory / relative).chmod(0o755)
+        packed = self.root / "asset.tar.xz"
+        sha256 = build.pack(directory, packed)
+        packed.rename(self.release / catalog.prebuilt_asset(name, sha256))
+        return sha256
+
+    def test_source_kernel(self):
+        name = "linux-7.2.13-hz1000"
+        files = {
+            "kernel.json": b'{"name": "linux-7.2.13-hz1000"}',
+            "vmlinuz": b"image",
+            "config": b"CONFIG_HZ=1000\n",
+        }
+        sha256 = self.publish(name, files)
+        with patch.dict(catalog.PREBUILT, {name: sha256}):
+            machine.fetch_prebuilt(name)
+        record = machine.kernel_record(name)
+        self.assertEqual(record["name"], name)
+        self.assertEqual(
+            (record["prebuilt"]["asset"], record["prebuilt"]["sha256"]),
+            (catalog.prebuilt_asset(name, sha256), sha256),
+        )
+        self.assertEqual((self.store / "kernels" / name / "vmlinuz").read_bytes(), b"image")
+        self.assertEqual(list((self.store / "downloads").iterdir()), [])
+
+    def test_a_digest_mismatch_installs_nothing(self):
+        name = "linux-7.2.13-hz1000"
+        sha256 = self.publish(name, {"kernel.json": b"{}", "vmlinuz": b"image", "config": b""})
+        wrong = "f" * 64
+        shutil.copy(
+            self.release / catalog.prebuilt_asset(name, sha256),
+            self.release / catalog.prebuilt_asset(name, wrong),
+        )
+        with (
+            patch.dict(catalog.PREBUILT, {name: wrong}),
+            self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"),
+        ):
+            machine.fetch_prebuilt(name)
+        self.assertEqual(list(self.store.iterdir()), [self.store / "downloads"])
+
+    def test_distribution_schedulers_must_match_the_kernel_image(self):
+        kernel = self.store / "kernels" / "fedora-44"
+        kernel.mkdir(parents=True)
+        (kernel / "vmlinuz").write_bytes(b"fedora image")
+        (kernel / "kernel.json").write_text(json.dumps({"name": "fedora-44", "kind": "distribution"}))
+        built = {
+            "name": "fedora-44",
+            "kind": "schedulers",
+            "kernel_vmlinuz_sha256": hashlib.sha256(b"fedora image").hexdigest(),
+            "schedulers": {"scx_simple": "1" * 64},
+        }
+        sha256 = self.publish(
+            "fedora-44", {"schedulers.json": json.dumps(built).encode(), "scx/scx_simple": b"\x7fELF"}
+        )
+        with patch.dict(catalog.PREBUILT, {"fedora-44": sha256}):
+            machine.fetch_prebuilt("fedora-44")
+            record = machine.kernel_record("fedora-44")
+            self.assertEqual(record["schedulers"], {"scx_simple": "1" * 64})
+            self.assertEqual(record["schedulers_build"]["kind"], "schedulers")
+            self.assertEqual(record["prebuilt"]["sha256"], sha256)
+            self.assertTrue(os.access(kernel / "scx/scx_simple", os.X_OK))
+            (kernel / "vmlinuz").write_bytes(b"an updated fedora image")
+            with self.assertRaisesRegex(RuntimeError, "another fedora-44 kernel image"):
+                machine.fetch_prebuilt("fedora-44")
+
+
 class GuestTests(unittest.TestCase):
     def test_commands(self):
         args, extra = guest.command(
@@ -236,6 +421,35 @@ class HostTests(unittest.TestCase):
             host.vm_spec(self.options(kernel=k, scx="scx_simple")) for k in ("fedora-44", "linux-7.2.13-scx")
         ]
         self.assertEqual(host.scx_builds(specs), ["fedora-44"])
+
+    def provide(self, stores, prebuilt=True, download_status=0):
+        """The container commands ensure_kernels runs, given the store before and after downloads."""
+        calls = []
+
+        def container(_image, args, **_options):
+            calls.append(args)
+            return download_status if args[1] == "prebuilt" else 0
+
+        with (
+            patch.object(host, "build_image"),
+            patch.object(host, "stored_kernels", side_effect=stores),
+            patch.object(host, "container", side_effect=container),
+        ):
+            host.ensure_kernels(["linux-7.2.13-hz1000", "linux-7.2.13-hz300"], prebuilt=prebuilt)
+        return calls
+
+    def test_published_builds_are_downloaded_and_the_rest_built(self):
+        downloaded = {"linux-7.2.13-hz1000": {}}
+        self.assertEqual(
+            self.provide([{}, downloaded]),
+            [
+                ["schedlab.vm.machine", "prebuilt", "linux-7.2.13-hz1000"],
+                ["schedlab.vm.build", "linux-7.2.13-hz300"],
+            ],
+        )
+        builds = [["schedlab.vm.build", "linux-7.2.13-hz1000"], ["schedlab.vm.build", "linux-7.2.13-hz300"]]
+        self.assertEqual(self.provide([{}, {}], download_status=1)[1:], builds)
+        self.assertEqual(self.provide([{}], prebuilt=False), builds)
 
     def test_store_directory_override(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"SCHEDLAB_VM_STORE": temp}):

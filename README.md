@@ -79,7 +79,9 @@ hardware. `load-external` measures with no generator, while your own workload ru
 through podman, without rebooting or changing the host. Guests boot pinned
 distribution kernels (Ubuntu 5.4; Debian 6.1, 6.12 and 7.2; Rocky 9 and 10; Fedora
 44; RT builds of Debian and Rocky) or kernel.org releases built with a chosen
-preemption model, HZ, `nohz_full` or sched_ext. Named matrices compare kernels,
+preemption model, HZ, `nohz_full` or sched_ext. The builds the matrices need are
+published as reproducible, attested release assets, so they download in seconds
+instead of building for minutes to hours. Named matrices compare kernels,
 distributions, preemption models, CPU isolation, SMT and NUMA topologies, host
 load stealing vCPU time, and sched_ext BPF schedulers.
 `vm test` runs the opt-in RT, DEADLINE and cgroup checks as root inside a guest.

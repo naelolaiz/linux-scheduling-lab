@@ -4,9 +4,12 @@ Distribution kernels are pinned packages (.deb or .rpm). Each package lists a pr
 fallback that keeps it after the distribution moves on (snapshot.debian.org, Launchpad, Fedora's
 Koji, Rocky's vault) and is verified against its SHA-256; only the kernel image and its config are
 kept. Source kernels are kernel.org releases built with lab-chosen options; their names spell the
-options (see `parse_source`).
+options (see `parse_source`). The builds the matrices need are also published (see `PREBUILT`).
+
+Usage: python3 -m schedlab.vm.catalog prints the published builds and their assets as JSON (for CI).
 """
 
+import json
 import re
 
 DEBIAN = "http://deb.debian.org/debian/"
@@ -292,6 +295,38 @@ def kernel_kind(name):
     raise ValueError(f"unknown kernel '{name}': use one of {', '.join(KERNELS)} or linux-VERSION[-options]")
 
 
+# The lab's own builds, published as assets of one GitHub release by .github/workflows/kernels.yml
+# and pinned here by each asset's SHA-256: a source kernel whole, a distribution kernel's sched_ext
+# schedulers only (the kernel itself comes from the distribution). The builds are reproducible, so
+# `schedlab vm verify NAME` rebuilds one and must arrive at the same file; it also prints the digest
+# of a new or changed build. Asset names carry the start of their digest, so a new build never
+# replaces one that an older checkout pins.
+PREBUILT_URL = "https://github.com/naelolaiz/linux-scheduling-lab/releases/download/kernels/"
+PREBUILT = {
+    "linux-7.2.13-hz100": "0000000000000000000000000000000000000000000000000000000000000000",
+    "linux-7.2.13-hz250": "0000000000000000000000000000000000000000000000000000000000000000",
+    "linux-7.2.13-hz1000": "179a4b74cdcee47a3bdca76fb168e2ab4e73a73ea77564209064d70e33a53772",
+    "linux-7.2.13-scx": "0000000000000000000000000000000000000000000000000000000000000000",
+    "fedora-44": "0000000000000000000000000000000000000000000000000000000000000000",
+    "rocky-10": "0000000000000000000000000000000000000000000000000000000000000000",
+    "rocky-10-rt": "0000000000000000000000000000000000000000000000000000000000000000",
+}
+
+
+def prebuilt_asset(name, sha256):
+    contents = "" if kernel_kind(name) == "source" else "-schedulers"
+    return f"{name}{contents}-{sha256[:16]}.tar.xz"
+
+
+def prebuilt(name):
+    """The published build of `name` as a package for machine.download, or None."""
+    sha256 = PREBUILT.get(name)
+    if sha256 is None:
+        return None
+    asset = prebuilt_asset(name, sha256)
+    return {"asset": asset, "urls": [PREBUILT_URL + asset], "sha256": [sha256]}
+
+
 # One VM configuration: kernel, extra boot parameters, CPU topology and placement, host-side load
 # and an optional sched_ext scheduler. A matrix runs the same preset in each.
 MATRICES = {
@@ -369,7 +404,7 @@ MATRICES = {
         ],
     },
     "sched_ext": {
-        "description": "EEVDF against two sched_ext example BPF schedulers (built on first use)",
+        "description": "EEVDF against two sched_ext example BPF schedulers",
         "entries": [
             {"name": "eevdf", "kernel": "fedora-44"},
             {"name": "scx_simple", "kernel": "fedora-44", "scx": "scx_simple"},
@@ -377,7 +412,15 @@ MATRICES = {
         ],
     },
     "timer-hz": {
-        "description": "One source release built with HZ 100, 250 and 1000 (builds on first use)",
+        "description": "One source release built with HZ 100, 250 and 1000",
         "entries": [{"name": f"hz{hz}", "kernel": f"linux-7.2.13-hz{hz}"} for hz in (100, 250, 1000)],
     },
 }
+
+
+def main():
+    print(json.dumps([{"name": name, "asset": prebuilt(name)["asset"]} for name in PREBUILT], indent=2))
+
+
+if __name__ == "__main__":
+    main()

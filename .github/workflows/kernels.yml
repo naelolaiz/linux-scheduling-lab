@@ -55,8 +55,9 @@ jobs:
       matrix:
         name: ${{ fromJSON(needs.plan.outputs.names) }}
     runs-on: ubuntu-24.04
-    # A sched_ext kernel, with its debug information and BTF, takes about two hours on 4 CPUs.
-    timeout-minutes: 300
+    # The slowest build, a sched_ext kernel with its debug information and BTF, takes about half an
+    # hour on a hosted runner.
+    timeout-minutes: 90
     env:
       NAME: ${{ matrix.name }}
       SCHEDLAB_VM_STORE: ${{ github.workspace }}/.vm-store

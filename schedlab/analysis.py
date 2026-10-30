@@ -80,20 +80,33 @@ def _share(part, whole):
     return min(1.0, max(0.0, part / whole))
 
 
+# Busy time is sampled once per tick, so each reading can be off by about a tick at either end of
+# the window; below this many ticks a share would be mostly sampling error.
+MIN_WINDOW_TICKS = 20
+
+
 def contention_values(core):
-    """Runqueue wait and who else used the measured CPU and its SMT siblings, from "contention"."""
+    """Runqueue wait and who else used the measured CPU and its SMT siblings, from "contention".
+
+    The wait is exact; the tick-sampled shares are left out for windows too short to resolve them.
+    """
     contention = core.get("contention") or {}
     if contention.get("status") != "ok":
         return {"wait_ms": None, "others_share": None, "sibling_busy_share": None}
     window = contention.get("window_ns")
+    wait = contention.get("runqueue_wait_ns")
+    values = {
+        "wait_ms": wait / 1e6 if wait is not None else None,
+        "others_share": None,
+        "sibling_busy_share": None,
+    }
+    if not window or window < MIN_WINDOW_TICKS * (contention.get("tick_ns") or 10_000_000):
+        return values
     siblings = [_share(busy, window) for busy in contention.get("smt_siblings_busy_ns") or []]
     siblings = [share for share in siblings if share is not None]
-    wait = contention.get("runqueue_wait_ns")
-    return {
-        "wait_ms": wait / 1e6 if wait is not None else None,
-        "others_share": _share(contention.get("cpu_others_run_ns"), window),
-        "sibling_busy_share": sum(siblings) / len(siblings) if siblings else None,
-    }
+    values["others_share"] = _share(contention.get("cpu_others_run_ns"), window)
+    values["sibling_busy_share"] = sum(siblings) / len(siblings) if siblings else None
+    return values
 
 
 def load_values(core):

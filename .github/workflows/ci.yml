@@ -75,6 +75,46 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  vm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # A directory instead of the podman volume, so the kernels can be cached between runs.
+      SCHEDLAB_VM_STORE: ${{ github.workspace }}/.vm-store
+    steps:
+      - uses: actions/checkout@v7
+      - name: Let the runner user open /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: actions/cache@v6
+        with:
+          path: .vm-store
+          key: vm-store-${{ hashFiles('schedlab/vm/catalog.py') }}
+      - name: Kernel and preemption matrices, root-sandbox checks (examples, not a performance gate; no uv)
+        run: |
+          python3 -m schedlab vm matrix kernels quick --repetitions 1 --out results/vm/kernels
+          python3 -m schedlab vm matrix preemption audio --repetitions 1 --out results/vm/preemption
+          python3 -m schedlab vm test --kernel debian-7.2-rt --out results/vm/test
+      - name: Analysis in the job summary
+        if: ${{ !cancelled() }}
+        run: |
+          shopt -s nullglob
+          for matrix in results/vm/kernels results/vm/preemption; do
+            runs=("$matrix"/*/run.json)
+            if [ ${#runs[@]} -gt 0 ]; then
+              python3 -m schedlab analyze "${runs[@]}" --format markdown >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vm-results
+          path: results/vm/
+          retention-days: 7
+
   sanitizers:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

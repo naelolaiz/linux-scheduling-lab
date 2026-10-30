@@ -4,9 +4,12 @@ This track answers a narrower question than "which kernel or CPU is best?":
 **for this unchanged workload, placement and environment, what changed in the
 observed timing distribution?** Run the [beginner tutorial](TUTORIAL.md) first.
 
-The lab never installs/rebuilds a kernel, edits the bootloader, loads a BPF
-scheduler, disables RT throttling, changes a governor, or moves interrupts.
-Administration and reboot decisions remain separate, manual work.
+On the host, the lab never installs or rebuilds a kernel, edits the bootloader,
+loads a BPF scheduler, disables RT throttling, changes a governor, or moves
+interrupts. Administration and reboot decisions remain separate, manual work.
+[Virtual machines](VIRTUAL_MACHINES.md) do the kernel, boot-parameter and sched_ext
+parts inside disposable QEMU/KVM guests instead, without rebooting or changing the
+host; their timings describe the guest, not the bare machine.
 
 ## 1. A reproducible comparison protocol
 
@@ -278,8 +281,10 @@ their own modes rather than a universal policy for all processors.
 Configuration alone does not activate it. Depending on switch-partial flags,
 even tasks whose reported policy is OTHER/BATCH/IDLE may be scheduled by
 sched_ext. Therefore requested/effective policy alone does not prove which fair
-implementation ran. Loading/removing a BPF scheduler is explicitly outside this
-lab's automation; on a managed test boot, reuse fairness/mixed and compare.
+implementation ran. On the host, loading/removing a BPF scheduler is outside this
+lab's automation; on a managed test boot, reuse fairness/mixed and compare. In a
+VM, `schedlab vm matrix sched_ext PRESET` loads the kernel's example schedulers for
+you and records their state.
 
 Sources: [sched_ext activation, switch-partial behavior and diagnostic interfaces](https://docs.kernel.org/scheduler/sched-ext.html)
 and its [v6.12 Kconfig requirements](https://github.com/torvalds/linux/blob/v6.12/kernel/Kconfig.preempt).
@@ -288,8 +293,9 @@ the kernel and scheduler implementation under test.
 
 **Native versus emulated evidence:** native x86-64/arm64 CI tests validate output
 and API behavior, not hardware latency. RISC-V/arm64 cross jobs only compile.
-QEMU user/system emulation, if you add it, is a separate correctness technique;
-label its results emulated, never RT measurements on that ISA.
+`schedlab vm` boots x86-64 kernels under KVM and labels every such run with its VM
+configuration ([virtual machines](VIRTUAL_MACHINES.md)). Its TCG mode, and QEMU
+emulation of another ISA, check behaviour only, never RT measurements.
 
 Sources: the [actual CI commands](../.github/workflows/ci.yml),
 [hosted-runner platforms](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),

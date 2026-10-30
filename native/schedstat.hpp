@@ -103,15 +103,19 @@ public:
             return CpuTicks{(ticks_end_[index]->busy - ticks_start_[index]->busy) * tick_ns(),
                             (ticks_end_[index]->steal - ticks_start_[index]->steal) * tick_ns()};
         };
-        const auto own_cpu = delta(0);
-        const auto busy = own_cpu ? std::optional<std::uint64_t>(own_cpu->busy) : std::nullopt;
+        std::optional<std::uint64_t> busy;
+        std::optional<std::uint64_t> others_run;
+        std::optional<std::uint64_t> steal;
+        if (const auto own_cpu = delta(0)) {
+            busy = own_cpu->busy;
+            others_run = own_cpu->busy > own_run_ns ? own_cpu->busy - own_run_ns : 0;
+            steal = own_cpu->steal;
+        }
         section.field("cpu", cpu_ >= 0 ? std::optional<int>(cpu_) : std::nullopt)
             .field("tick_ns", tick_ns())
             .field("cpu_busy_ns", busy)
-            .field("cpu_others_run_ns",
-                   busy ? std::optional<std::uint64_t>(*busy > own_run_ns ? *busy - own_run_ns : 0)
-                        : std::nullopt)
-            .field("cpu_steal_ns", own_cpu ? std::optional<std::uint64_t>(own_cpu->steal) : std::nullopt);
+            .field("cpu_others_run_ns", others_run)
+            .field("cpu_steal_ns", steal);
         std::vector<int> sibling_cpus;
         std::vector<std::optional<std::uint64_t>> sibling_busy;
         for (std::size_t index = 1; index < cpus_.size(); index++) {

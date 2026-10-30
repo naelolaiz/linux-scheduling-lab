@@ -50,7 +50,8 @@ same tests with any report failing the run; their timings are not measurements.
 
 **Start with the [tutorial](docs/TUTORIAL.md).** It explains each hypothesis,
 command, measurement, tradeoff, permission and exercise. Continue with the
-[kernel/hardware comparison track](docs/KERNELS_AND_HARDWARE.md) and
+[kernel/hardware comparison track](docs/KERNELS_AND_HARDWARE.md),
+[virtual machines](docs/VIRTUAL_MACHINES.md) and
 [optional resource/hardware experiments](docs/ADVANCED.md). The
 [threading and code practices chapter](docs/THREADING_AND_CODE.md) includes a
 runnable C++20 [`std::jthread`](https://en.cppreference.com/w/cpp/thread/jthread.html)/bounded-queue
@@ -73,6 +74,19 @@ SMT sibling, the other cores or everywhere, at different priorities. Each measur
 job records its runqueue wait, the CPU share other tasks took and how busy its
 SMT sibling was, so the analysis can tell scheduling competition from shared
 hardware. `load-external` measures with no generator, while your own workload runs.
+
+[`schedlab vm`](docs/VIRTUAL_MACHINES.md) runs the same presets in QEMU/KVM guests
+through podman, without rebooting or changing the host. Guests boot pinned
+distribution kernels (Ubuntu 5.4; Debian 6.1, 6.12 and 7.2; Rocky 9 and 10; Fedora
+44; RT builds of Debian and Rocky) or kernel.org releases built with a chosen
+preemption model, HZ, `nohz_full` or sched_ext. Named matrices compare kernels,
+distributions, preemption models, CPU isolation, SMT and NUMA topologies, host
+load stealing vCPU time, and sched_ext BPF schedulers.
+`vm test` runs the opt-in RT, DEADLINE and cgroup checks as root inside a guest.
+
+```sh
+python3 -m schedlab vm matrix preemption audio --out results/vm-preemption
+```
 
 Runs contain raw timestamp CSVs, requested/effective scheduler settings,
 [WAV](https://docs.python.org/3/library/wave.html)/[PGM](https://manpages.debian.org/bookworm/netpbm/pgm.5.en.html)

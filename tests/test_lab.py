@@ -148,6 +148,7 @@ class NativeTests(unittest.TestCase):
         self.assertGreaterEqual(contention["runqueue_wait_ns"], 0)
         self.assertEqual(contention["cpu"], self.cpu)
         self.assertLessEqual(contention["run_ns"], contention["window_ns"])
+        self.assertGreaterEqual(contention["cpu_steal_ns"], 0)
         self.assertEqual(len(contention["smt_siblings"]), len(contention["smt_siblings_busy_ns"]))
 
     def test_fault_probe(self):

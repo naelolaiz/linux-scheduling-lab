@@ -634,6 +634,7 @@ The `uv run poe …` forms are optional shortcuts for the plain commands beside 
 | `python3 -m schedlab replay RUN.json --out DIR` | Rerun a validated preset with current code; renew privileged opt-ins |
 | `python3 -m schedlab compare DIR1 DIR2 --out DIR3` | Compare manifests from directories or `run.json` paths |
 | `python3 -m schedlab analyze DIR... [--format text\|markdown\|json] [--out FILE]`, `uv run poe analyze DIR...` | Per-case table and bar plot, preset findings, caveats; several runs add a same-case comparison |
+| `python3 -m schedlab vm run PRESET --kernel K`, `vm matrix NAME PRESET`, `vm test`, `uv run poe vm ...` | The same presets in QEMU/KVM guests with other kernels, boot parameters, topologies or host load; [virtual machines](VIRTUAL_MACHINES.md) |
 | `./build/default/sched-work --help` | Full native option list and bounds |
 | `./build/default/sched-work --build-info` | Compiler, flags, sanitizers and C/C++ libraries of this binary |
 | `./build/default/sched-load --help` | Bounded background load generator used by the `load-*` presets |
@@ -707,6 +708,7 @@ single-threaded.
 | cgroup weight/quota | cgroup | Explicit CPU delegation; memory/I/O/cpusets manual |
 | Background load: kinds, placement, priority, sessions | load-audio, load-offline, load-placement, load-priority, load-external | Synthetic stand-ins; no device IRQs, GPU or thermal history; RT load opt-in |
 | Kernel and architecture comparison | doctor, replay, compare | Boot/config changes performed separately by an administrator |
+| Kernels, distributions, preemption models, isolation, sched_ext, steal time | `vm matrix` kernels, distributions, preemption, rt, isolation, topology, neighbour, sched_ext, timer-hz | Guest timings, not bare metal; needs podman and KVM |
 | PREEMPT_RT, IRQ chains, isolation, power, uclamp, sched_ext | Inventory and documented recipes | No global tuning or scheduler loading |
 | Actual XRUNs, cyclictest/rtla, ffmpeg | Not in default suite | Optional hardware/tool-specific experiments |
 
@@ -801,5 +803,6 @@ Normative references:
 - [EEVDF](https://docs.kernel.org/scheduler/sched-eevdf.html)
 
 The kernel documentation and system-call contracts are the technical authority.
-Continue with [kernels/hardware](KERNELS_AND_HARDWARE.md) and
+Continue with [kernels/hardware](KERNELS_AND_HARDWARE.md),
+[virtual machines](VIRTUAL_MACHINES.md) and
 [advanced manual experiments](ADVANCED.md), keeping the beginner defaults intact.

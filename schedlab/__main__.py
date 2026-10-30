@@ -8,6 +8,7 @@ from .analysis import analyze, analyze_manifest, load_manifest, render, render_f
 from .environment import capture
 from .report import compare, write_report
 from .runner import BINARY, PRESETS, run
+from .vm import host as vm
 
 
 def bounded_repetitions(value):
@@ -57,8 +58,11 @@ def main(argv=None):
     )
     replay.add_argument("--cgroup-parent", type=Path, help="renew cgroup delegation; never inherited")
     replay.add_argument("--label")
+    vm.add_parser(commands)
     args = parser.parse_args(argv)
     try:
+        if args.command == "vm":
+            return vm.main(args)
         if args.command == "doctor":
             text = json.dumps(capture(BINARY if BINARY.is_file() else None), indent=2) + "\n"
             if args.out:
@@ -113,7 +117,7 @@ def main(argv=None):
         except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
             print(f"analysis unavailable: {exc}", file=sys.stderr)
         return 1 if states["error"] else 0
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

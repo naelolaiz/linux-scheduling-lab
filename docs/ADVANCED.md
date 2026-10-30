@@ -86,6 +86,9 @@ also run inside a throwaway container. The container builds from a read-only
 copy of the checkout and is deleted on exit. It shares the host kernel, so the
 real scheduler is exercised. Run these from the repository root on an otherwise
 idle machine; they are commands for you to run, and the lab never invokes sudo.
+To run the same checks as root in a disposable guest kernel instead, without sudo
+or RT limits on the host, use `python3 -m schedlab vm test`
+([virtual machines](VIRTUAL_MACHINES.md#6-a-root-sandbox-for-the-opt-in-checks)).
 
 **FIFO/RR and priority inheritance, unprivileged.** These need only an RT-priority
 limit. Rootless podman can pass one down when your hard limit allows it

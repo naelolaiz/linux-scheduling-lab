@@ -1,0 +1,6 @@
+#!/usr/bin/python3 -I
+"""PID 1 of a lab VM; see schedlab/vm/guest.py."""
+
+from schedlab.vm.guest import main
+
+main()

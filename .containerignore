@@ -1,0 +1,6 @@
+# Build context for vm/Containerfile: sources only.
+.git
+.venv
+build
+results
+**/__pycache__

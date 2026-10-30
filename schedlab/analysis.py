@@ -86,19 +86,21 @@ MIN_WINDOW_TICKS = 20
 
 
 def contention_values(core):
-    """Runqueue wait and who else used the measured CPU and its SMT siblings, from "contention".
+    """Runqueue wait, who else used the measured CPU and its SMT siblings, and (in a VM) how much
+    of the measured vCPU's time the host took, from "contention".
 
     The wait is exact; the tick-sampled shares are left out for windows too short to resolve them.
     """
     contention = core.get("contention") or {}
     if contention.get("status") != "ok":
-        return {"wait_ms": None, "others_share": None, "sibling_busy_share": None}
+        return {"wait_ms": None, "others_share": None, "sibling_busy_share": None, "steal_share": None}
     window = contention.get("window_ns")
     wait = contention.get("runqueue_wait_ns")
     values = {
         "wait_ms": wait / 1e6 if wait is not None else None,
         "others_share": None,
         "sibling_busy_share": None,
+        "steal_share": None,
     }
     if not window or window < MIN_WINDOW_TICKS * (contention.get("tick_ns") or 10_000_000):
         return values
@@ -106,6 +108,7 @@ def contention_values(core):
     siblings = [share for share in siblings if share is not None]
     values["others_share"] = _share(contention.get("cpu_others_run_ns"), window)
     values["sibling_busy_share"] = sum(siblings) / len(siblings) if siblings else None
+    values["steal_share"] = _share(contention.get("cpu_steal_ns"), window)
     return values
 
 
@@ -892,8 +895,9 @@ def _runnable_others(load):
     return int(running) - 1 if running.isdigit() else None
 
 
-def _busy_caveats(before, after):
-    """Other work outside the lab, judged when no lab worker runs: just before and after the run."""
+def _busy_caveats(before, after, host=False):
+    """Other work outside the lab, judged when no lab worker runs: just before and after the run.
+    With `host`, the snapshots are of the machine running a lab VM."""
     cpus = _online_cpus(before)
     threshold = max(2, cpus // 4)
     counts = [_runnable_others(snapshot.get("load")) for snapshot in (before, after)]
@@ -911,6 +915,12 @@ def _busy_caveats(before, after):
         if count is not None
     ]
     detail = f" ({'; '.join(context)})" if context else ""
+    if host:
+        return [
+            f"Other work was running on the {cpus}-CPU host: {' and '.join(moments)}{detail}. It competes "
+            "with the vCPU threads, so tails and throughput describe a busy host; repeat on an idle one "
+            "before comparing."
+        ]
     return [
         f"Other work was running on this {cpus}-CPU machine: {' and '.join(moments)}{detail}. It can share "
         "the measured CPU, its SMT sibling and the power budget, so tails and throughput describe a busy "
@@ -946,6 +956,145 @@ def _shared_core_caveats(manifest, cases):
     ]
 
 
+PREEMPT_CONFIG = (
+    ("CONFIG_PREEMPT_LAZY", "lazy"),
+    ("CONFIG_PREEMPT", "full"),
+    ("CONFIG_PREEMPT_VOLUNTARY", "voluntary"),
+    ("CONFIG_PREEMPT_NONE", "none"),
+)
+
+
+def _dynamic_preemption(environment):
+    """The model debugfs marks as active ("none (voluntary) full"), or None when unreadable."""
+    active = _read_value((environment.get("runtime") or {}).get("/sys/kernel/debug/sched/preempt"))
+    if active and "(" in active and ")" in active:
+        return active[active.index("(") + 1 : active.index(")")]
+    return None
+
+
+def preemption_mode(environment):
+    """The active preemption model, or None when it cannot be known from the snapshot.
+
+    PREEMPT_DYNAMIC kernels show the active model in parentheses in debugfs (readable by root);
+    otherwise the compile-time model is the active one.
+    """
+    options = (environment.get("kernel_config") or {}).get("options") or {}
+    if options.get("CONFIG_PREEMPT_RT") == "y":
+        return "rt"
+    active = _dynamic_preemption(environment)
+    if active:
+        return active
+    if options.get("CONFIG_PREEMPT_DYNAMIC") == "y":
+        return None
+    return next((name for symbol, name in PREEMPT_CONFIG if options.get(symbol) == "y"), None)
+
+
+def vm_summary(vm):
+    """One line describing the VM a run was measured in, or None for a run on the machine itself."""
+    if not isinstance(vm, dict):
+        return None
+    shape = vm.get("topology") or {}
+    accel = "QEMU/KVM" if vm.get("accel", "kvm") == "kvm" else "QEMU TCG emulation"
+    parts = [f"{(vm.get('kernel') or {}).get('name', 'unknown kernel')} in {accel}"]
+    cpus = f"{shape.get('cpus', '?')} vCPUs"
+    if shape.get("threads", 1) > 1:
+        cpus += f" as {shape.get('cores')} cores × {shape['threads']} threads"
+    parts.append(cpus)
+    if (vm.get("numa_nodes") or 1) > 1:
+        parts.append(f"{vm['numa_nodes']} NUMA nodes")
+    if vm.get("boot"):
+        parts.append(f"boot {vm['boot']}")
+    pinning = vm.get("pinning")
+    if pinning:
+        parts.append(f"pinned to host CPUs {','.join(str(pinning[key]) for key in sorted(pinning, key=int))}")
+    if vm.get("neighbour"):
+        parts.append(f"host {vm['neighbour'].get('kind')} load on those CPUs")
+    if vm.get("sched_ext"):
+        parts.append(f"sched_ext {vm['sched_ext']}")
+    return ", ".join(parts)
+
+
+def _steal(cases, threshold=0.02):
+    return [
+        f"{case['case']} {case['medians']['steal_share']:.0%}"
+        for case in cases
+        if (case["medians"].get("steal_share") or 0) >= threshold
+    ]
+
+
+def _steal_accounting(manifest):
+    """How this guest kernel charges stolen time, for sentences that report steal."""
+    options = ((manifest.get("environment") or {}).get("kernel_config") or {}).get("options") or {}
+    if options.get("CONFIG_PARAVIRT_TIME_ACCOUNTING") == "y":
+        return ""
+    return (
+        " This kernel lacks CONFIG_PARAVIRT_TIME_ACCOUNTING, so a task's own CPU time includes the time "
+        "stolen from it."
+    )
+
+
+def _vm_findings(manifest, cases):
+    vm = manifest.get("vm")
+    if not isinstance(vm, dict) or not vm.get("neighbour"):
+        return []
+    stolen = _steal(cases)
+    kind = vm["neighbour"].get("kind")
+    if not stolen:
+        return [
+            _finding(f"Host {kind} load on the vCPUs' CPUs took no measurable time from the measured vCPU.")
+        ]
+    return [
+        _finding(
+            f"Host {kind} load on the vCPUs' CPUs stole part of the measured vCPU (steal): "
+            f"{', '.join(stolen)}. The guest's own scheduler cannot see or prevent that time."
+            + _steal_accounting(manifest),
+            steal=stolen,
+        )
+    ]
+
+
+def _vm_caveats(manifest, cases):
+    vm = manifest.get("vm")
+    if not isinstance(vm, dict):
+        return []
+    if vm.get("accel", "kvm") == "kvm":
+        caveats = [
+            "Measured inside a QEMU/KVM guest: each vCPU is a host thread, so timings include host "
+            "scheduling and virtualization exits. Compare VM runs with each other, not with bare-metal runs."
+        ]
+    else:
+        caveats = [
+            "Emulated with QEMU TCG: instruction timing is emulated, so these runs check behaviour only."
+        ]
+    # A kernel ignores a preempt= model it does not offer (7.x on x86 keeps only full and lazy).
+    requested = next(
+        (part.partition("=")[2] for part in str(vm.get("boot") or "").split() if part.startswith("preempt=")),
+        None,
+    )
+    active = _dynamic_preemption(manifest.get("environment") or {})
+    if requested and active and requested != active:
+        caveats.append(
+            f"Booted with preempt={requested}, but the kernel ran '{active}': it does not offer that model, "
+            f"so this run measures '{active}'."
+        )
+    if not vm.get("pinning"):
+        caveats.append(
+            "The vCPUs were not pinned, so the host could move them between its CPUs and SMT siblings "
+            "during the run; `--pin` gives each vCPU one host CPU."
+        )
+    stolen = _steal(cases)
+    if stolen and not vm.get("neighbour"):
+        caveats.append(
+            f"The host took part of the measured vCPU's time (steal): {', '.join(stolen)}. That time "
+            "belongs neither to the task nor to other guest tasks." + _steal_accounting(manifest)
+        )
+    host = vm.get("host") or {}
+    before = {"load": host.get("load_before"), "allowed_cpus": host.get("allowed_cpus")}
+    after = {"load": host.get("load_after")}
+    caveats.extend(_busy_caveats(before, after, host=True))
+    return caveats
+
+
 def _caveats(manifest, cases):
     caveats = []
     environment = manifest.get("environment") or {}
@@ -970,6 +1119,7 @@ def _caveats(manifest, cases):
             caveats.append(f"Build type '{build.get('build_type') or 'none'}' is not the optimized default.")
     caveats.extend(_busy_caveats(environment, manifest.get("environment_after") or {}))
     caveats.extend(_shared_core_caveats(manifest, cases))
+    caveats.extend(_vm_caveats(manifest, cases))
     cpu = manifest.get("selected_cpu")
     topology = (environment.get("cpu_topology") or {}).get(str(cpu)) or {}
     governor = _read_value(topology.get("cpufreq/scaling_governor"))
@@ -1015,6 +1165,7 @@ def analyze_manifest(manifest, source=""):
     findings = []
     for compute in PRESET_FINDINGS.get(manifest.get("preset"), []):
         findings.extend(compute(manifest, cases))
+    findings.extend(_vm_findings(manifest, cases))
     statuses = {"ok": 0, "skipped": 0, "error": 0}
     not_measured = []
     for run in manifest.get("runs", []):
@@ -1036,6 +1187,9 @@ def analyze_manifest(manifest, source=""):
             "kernel": system.get("kernel", "unknown"),
             "cpu": cpu_model or "unknown CPU",
             "allowed_cpus": len(environment.get("allowed_cpus") or []),
+            "preemption": preemption_mode(environment),
+            "hz": ((environment.get("kernel_config") or {}).get("options") or {}).get("CONFIG_HZ"),
+            "vm": vm_summary(manifest.get("vm")),
         },
         "build": build_summary(environment.get("native_build")),
         "cases": cases,
@@ -1067,6 +1221,9 @@ def compare_analyses(analyses):
         label
         for label, value in (
             ("kernel", lambda a: a["system"]["kernel"]),
+            ("preemption model", lambda a: a["system"].get("preemption")),
+            ("timer HZ", lambda a: a["system"].get("hz")),
+            ("VM configuration", lambda a: a["system"].get("vm")),
             ("architecture", lambda a: a["system"]["architecture"]),
             ("CPU model", lambda a: a["system"]["cpu"]),
             ("native build", lambda a: a["build"]),
@@ -1145,7 +1302,8 @@ def _case_rows(analysis):
 
 
 def contention_text(medians):
-    """'wait 0.4 ms, others 9%, SMT 99%': runqueue wait, others' share of the CPU, sibling busy share."""
+    """'wait 0.4 ms, others 9%, SMT 99%, steal 3%': runqueue wait, others' share of the CPU,
+    sibling busy share, and the host's share of a vCPU (shown only when there is some)."""
     parts = []
     if medians.get("wait_ms") is not None:
         parts.append(f"wait {format_number(medians['wait_ms'])} ms")
@@ -1153,6 +1311,8 @@ def contention_text(medians):
         parts.append(f"others {medians['others_share']:.0%}")
     if medians.get("sibling_busy_share") is not None:
         parts.append(f"SMT {medians['sibling_busy_share']:.0%}")
+    if medians.get("steal_share"):
+        parts.append(f"steal {medians['steal_share']:.0%}")
     return ", ".join(parts)
 
 
@@ -1164,10 +1324,12 @@ def _headline(analysis):
     )
     reps = f" · {repetitions} repetition{'' if repetitions == 1 else 's'}" if repetitions else ""
     system = analysis["system"]
-    machine = (
-        f"{system['architecture']} · Linux {system['kernel']} · {system['cpu']} · "
-        f"{system['allowed_cpus']} allowed CPUs"
-    )
+    kernel = f"Linux {system['kernel']}"
+    if system.get("preemption"):
+        kernel += f" (preempt {system['preemption']})"
+    if system.get("hz"):
+        kernel += f" · HZ {system['hz']}"
+    machine = f"{system['architecture']} · {kernel} · {system['cpu']} · {system['allowed_cpus']} allowed CPUs"
     return f"{analysis['preset']} · {analysis['status']} · {counts}{reps}", machine
 
 
@@ -1193,6 +1355,8 @@ def render_text(result):
             f"    {summary}",
             f"    {machine}",
         ]
+        if analysis["system"].get("vm"):
+            lines.append(f"    vm: {analysis['system']['vm']}")
         lines += [f"    build: {analysis['build']}", ""]
         lines += ["    " + line for line in _text_table(CASE_HEADER, _case_rows(analysis))]
         lines += _text_notes(analysis)
@@ -1272,10 +1436,11 @@ def _md_run(number, analysis):
     for cells in _case_rows(analysis):
         *text, plot = cells
         rows.append([_md(cell) for cell in text] + [f"`{plot}`" if plot else ""])
+    vm = analysis["system"].get("vm")
     lines = [
         f"**[{number}] {_md(analysis['title'])}** — `{_md(analysis['source'])}`  ",
         f"{_md(summary)}  ",
-        f"{_md(machine)} · {_md(analysis['build'])}",
+        f"{_md(machine)} · {_md(analysis['build'])}" + (f"  \nVM: {_md(vm)}" if vm else ""),
         "",
         *_md_table(
             ["Case", "Mode", "Policy", "OK", "Primary metric", "Median", "Range", "Contention", "Plot"],

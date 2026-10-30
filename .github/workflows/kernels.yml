@@ -1,0 +1,119 @@
+name: prebuilt-kernels
+
+# Builds what PREBUILT in schedlab/vm/catalog.py pins (source kernels and distribution kernels'
+# sched_ext schedulers) and publishes it as assets of the `kernels` release. A build is published only
+# when it reproduces its pinned SHA-256, which comes from a separate build (`schedlab vm verify`).
+on:
+  # Publishes the pinned builds that the release does not have yet.
+  workflow_dispatch:
+  # Rebuilds every pinned build when the recipe changes, to check that each still reproduces its
+  # pin; publishes nothing. Draft pull requests skip these hours of builds until marked ready.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - .github/workflows/kernels.yml
+      - schedlab/vm/build.py
+      - vm/Containerfile
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prebuilt-kernels-${{ github.event_name == 'workflow_dispatch' && 'publish' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      names: ${{ steps.plan.outputs.names }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pinned builds to make; when publishing, only those the release lacks (no uv)
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -m schedlab.vm.catalog > prebuilt.json
+          echo '[]' > published.json
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            gh release view kernels --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name]' \
+              > published.json || echo '[]' > published.json
+          fi
+          names=$(jq -c --slurpfile published published.json \
+            '[.[] | select(.asset as $asset | $published[0] | index($asset) | not) | .name]' prebuilt.json)
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+          echo "Builds to make: \`$names\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.names != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        name: ${{ fromJSON(needs.plan.outputs.names) }}
+    runs-on: ubuntu-24.04
+    # A sched_ext kernel, with its debug information and BTF, takes about two hours on 4 CPUs.
+    timeout-minutes: 300
+    env:
+      NAME: ${{ matrix.name }}
+      SCHEDLAB_VM_STORE: ${{ github.workspace }}/.vm-store
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space for the kernel tree
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h / | tail -1
+      - name: Rebuild and compare with the pinned SHA-256 (no uv)
+        run: python3 -m schedlab vm verify "$NAME" --assets dist
+      # Kept on a mismatch too, so the two builds can be compared.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: build-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    needs: [plan, build]
+    if: github.event_name == 'workflow_dispatch' && needs.plan.outputs.names != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: build-*
+          path: dist
+          merge-multiple: true
+      - name: The lab at this commit, the build recipe of the source offer
+        run: |
+          commit="${GITHUB_SHA::12}"
+          git archive --format=tar.gz --prefix="schedlab-$commit/" -o "dist/schedlab-$commit.tar.gz" HEAD
+      - uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+      - name: Add the assets the release lacks; published assets are never replaced
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release=(kernels --repo "$GITHUB_REPOSITORY")
+          if gh release view "${release[@]}" > /dev/null 2>&1; then
+            gh release edit "${release[@]}" --notes-file .github/kernels-release.md
+          else
+            gh release create "${release[@]}" --target "$GITHUB_SHA" --latest=false \
+              --title "Prebuilt lab kernels" --notes-file .github/kernels-release.md
+          fi
+          published=$(gh release view "${release[@]}" --json assets --jq '.assets[].name')
+          for file in dist/*; do
+            if ! grep -qxF "$(basename "$file")" <<< "$published"; then
+              gh release upload "${release[@]}" "$file"
+            fi
+          done

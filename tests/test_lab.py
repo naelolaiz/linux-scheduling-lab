@@ -10,7 +10,15 @@ import unittest
 from unittest.mock import patch
 import wave
 
-from schedlab.analysis import analyze, analyze_manifest, bar, compare_analyses, load_values, render
+from schedlab.analysis import (
+    analyze,
+    analyze_manifest,
+    bar,
+    compare_analyses,
+    contention_values,
+    load_values,
+    render,
+)
 from schedlab.cgroups import Unavailable, cpu_groups
 from schedlab.environment import capture, kernel_config, native_build, parse_cpu_list, read
 from schedlab.metrics import distribution, quantile, summarize
@@ -349,14 +357,15 @@ class HarnessTests(unittest.TestCase):
             root = Path(directory)
             script = root / "hang"
             pidfile = root / "child"
+            # The parent records the child at once; the timeout leaves room for a slow, loaded machine.
             script.write_text(
                 f"#!{sys.executable}\nimport os,time\nfrom pathlib import Path\n"
                 "pid=os.fork()\n"
-                f"if pid == 0:\n Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
+                f"if pid:\n Path({str(pidfile)!r}).write_text(str(pid))\n"
                 "time.sleep(30)\n"
             )
             script.chmod(0o700)
-            records = run_group([{"case": "hang"}], root, 1, binary=script, timeout=0.3)
+            records = run_group([{"case": "hang"}], root, 1, binary=script, timeout=2)
             self.assertEqual(records[0]["status"], "error")
             self.assertIn("timeout", records[0]["reason"])
             pid = int(pidfile.read_text())
@@ -959,6 +968,16 @@ class LoadAnalysisTests(unittest.TestCase):
             any("met other work on their core" in c and "offline" in c for c in analysis["caveats"])
         )
         self.assertIn("other work ran 40% of the measured CPU", analysis["findings"][0]["text"])
+
+    def test_short_windows_report_no_tick_sampled_shares(self):
+        # 26 ms is under three 10 ms ticks: busy time that coarse cannot give a share.
+        run = contended_run("offline", 1000, 1.0, 1.0, wait_ns=3e5)
+        run["core"]["contention"].update(window_ns=26e6, cpu_others_run_ns=15.6e6, tick_ns=1e7)
+        values = contention_values(run["core"])
+        self.assertEqual((values["others_share"], values["sibling_busy_share"]), (None, None))
+        self.assertAlmostEqual(values["wait_ms"], 0.3)
+        manifest = {"schema_version": 1, "preset": "quick", "repetitions": 3, "runs": [run]}
+        self.assertFalse(any("met other work" in caveat for caveat in analyze_manifest(manifest)["caveats"]))
 
 
 if __name__ == "__main__":
